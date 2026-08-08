@@ -77,7 +77,7 @@ The harness never decides *what*. The model never touches *how*.
 ## Quickstart
 
 ```bash
-git clone <this repo> && cd simple-agent
+git clone https://github.com/joshuamschultz/simple-agent && cd simple-agent
 ./setup.sh                    # venv + 2 dependencies + .env
 $EDITOR .env                  # paste one API key
 python3 agent.py
