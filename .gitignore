@@ -1,0 +1,54 @@
+# --- your data stays yours -------------------------------------------------
+# Anything the agent learns, is told, or is pointed at.
+# Note: gitignore has no trailing comments. Every comment gets its own line.
+
+# example / business data folders
+data/
+# memory.data and any other raw storage file
+*.data
+# memory, secrets, team dirs, trace logs
+agent_workspace/
+# alternate --workspace directories
+workspace*/
+# manifest, identity, team, recent traces
+agent_state.json
+*state*.json
+# append-only history
+traces.jsonl
+**/traces.jsonl
+
+# --- credentials -----------------------------------------------------------
+.env
+.env.*
+!.env.example
+.secrets.json
+**/.secrets.json
+*.pem
+*.key
+
+# --- python ----------------------------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- editors / os ----------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# --- scratch ---------------------------------------------------------------
+tmp/
+scratch/
+*.log
