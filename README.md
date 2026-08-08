@@ -1,481 +1,385 @@
-# simple-agent
+<p align="center">
+  <img src="assets/header.svg" alt="simple-agent — one class that builds its own harness while you use it" width="100%">
+</p>
 
-**An agent that writes its own tools, hires its own specialists, and edits its own system prompt.**
+<p align="center">
+  <a href="#quickstart"><img alt="setup" src="https://img.shields.io/badge/setup-one_command-4f9cf9"></a>
+  <img alt="dependencies" src="https://img.shields.io/badge/dependencies-2-7c5cff">
+  <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776ab">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-63d19e">
+</p>
 
-One file. One class. About 740 lines. No framework.
-
-```
-> reverse the word harness
-
-  ...notices it has no string tools
-  ...writes reverse_string, registers it, runs it in a subprocess
-
-The reversed form of "harness" is ssenrah
-```
-
-The tool is still there tomorrow. And the day after. That is the whole idea.
+<p align="center"><b>An assistant that builds its own abilities as you use it.<br>
+The more you work with it, the better it gets at <i>your</i> work.</b></p>
 
 ---
 
-## Why this exists
+## What this actually is
 
-Every agent framework ships you a toolbox. Someone else decided what is in it.
-You get a `search_web`, a `read_file`, a `run_sql`, and when your actual problem
-needs something slightly different, you go write a plugin, register it, restart,
-and hope the schema lines up.
+Most AI assistants come with a fixed set of abilities someone else chose. When
+your real work needs something a little different, you're stuck waiting for a
+plugin, an integration, or a new release.
 
-This one ships almost nothing. A handful of meta-tools: levers that let it change
-itself. Everything else it builds, on demand, while working on your problem, and
-keeps.
+This one starts with almost nothing on purpose. When it hits something it can't
+do, **it writes the ability itself, right then, and keeps it.**
 
-The bet underneath it is simple. **A model that can write Python can write its own
-tools better than you can guess them in advance.** Your job stops being "anticipate
-every capability" and becomes "correct it when it is wrong." That is a much
-smaller job, and one you are far better at.
+You talk to it in plain English. You never write code.
 
-What that buys you:
+### Watch it happen
 
-- **It gets better at your work specifically.** Not better at benchmarks. Better at
-  the shape of the things you actually ask for, because the tools it keeps are the
-  ones your questions demanded.
-- **It does not bloat.** As it grows tools, it promotes them into specialists, and
-  those tools leave its prompt. A hundred tools does not mean a hundred-tool
-  context. It stays fast while it gets deep.
-- **You can read all of it.** One file. Open it, follow the loop, change the parts
-  you disagree with. There is no plugin lifecycle, no dependency injection, no
-  four layers of abstraction between you and the model call.
-- **It is honest about failure.** Every tool call is recorded with its outcome. When
-  something silently does not work, the record shows it, and the agent reads its
-  own record.
-- **It separates code from judgment.** Deterministic work becomes a tool. Repeated
-  judgment becomes a skill. Most agents only have one of those, so everything
-  ends up crammed into whichever one they have.
+You ask something it has never been asked before:
+
+```
+> how did Q3 close out?
+```
+
+Instead of guessing, it builds what it needs:
+
+```
+  ✎ built a tool     parse_ledger      reads a ledger file into monthly totals
+  ▸ ran it           ledger_q3.csv  →  jul 41,200 · aug 38,650 · sep 52,310
+  ✎ wrote a note     margin_review     how you like quarters summarized
+  ✓ answered
+
+Q3 closed at $132,160, up 14% on Q2. September carried it — roughly
+half the quarter landed in the last five weeks.
+```
+
+Two things now exist that didn't sixty seconds ago:
+
+- **A tool.** Real working code that reads your ledger. It runs safely, in its own
+  sandbox, and it's there forever.
+- **A note to itself.** How *you* like quarters summarized. Judgment, not code.
+
+Ask next quarter and it just answers. That's the whole idea.
 
 ---
 
-## The split
+## The loop
 
-The design has exactly one rule, and every decision falls out of it:
+```mermaid
+flowchart LR
+    A["you ask<br/>in plain English"] --> B{"can it<br/>already?"}
+    B -->|yes| F["it answers"]
+    B -->|no| C["it builds<br/>the ability"]
+    C --> D["runs it<br/>safely"]
+    D --> F
+    F --> G["everything<br/>recorded"]
+    G --> H{"you correct it?<br/>time to review?"}
+    H -->|yes| I["it fixes the<br/>real cause"]
+    I --> B
+    H -->|no| A
 
-| The harness owns | The model owns |
-|---|---|
-| Growth mechanics (draft → validate → register) | *What* to build |
-| Sandboxed execution | *When* to promote a tool family into a specialist |
-| Secrets custody | *When* to dissolve one |
-| Raw storage | *What* to remember, and in what format |
-| Registries for tools, skills, team | *What its own system prompt should say* |
-| Trace log with outcomes | *When code is right and when prose is right* |
-
-Anything with judgment in it belongs to the model. Anything mechanical, and
-anything that must not be talked out of its job — the sandbox, the vault —
-belongs to the harness.
-
-The harness never decides *what*. The model never touches *how*.
+    classDef ask fill:#1a2740,stroke:#4f9cf9,color:#e8eefc
+    classDef make fill:#16233c,stroke:#63d19e,color:#e8eefc
+    classDef learn fill:#1e1a3a,stroke:#7c5cff,color:#e8eefc
+    class A,F ask
+    class C,D make
+    class G,H,I learn
+```
 
 ---
 
 ## Quickstart
 
+Three commands and one paste. About a minute.
+
 ```bash
 git clone https://github.com/joshuamschultz/simple-agent && cd simple-agent
-./setup.sh                    # venv + 2 dependencies + .env
-$EDITOR .env                  # paste one API key
-python3 agent.py
+./setup.sh
 ```
 
-That is the whole install. Two dependencies, both pure Python:
-`arcllm` (the LLM client) and `python-dotenv`. No vendor SDK, no framework,
-no build step. `setup.sh` uses [uv](https://github.com/astral-sh/uv) if you
-have it and falls back to `venv` + `pip` if you do not.
+Open the `.env` file it created, paste in an API key, save. Then:
 
-Any one key in `.env` is enough. Anthropic is the default; `--provider openai`
-switches. A local Ollama needs no key at all.
+```bash
+python3 agent.py
+```
 
 ```
 [cold start]
 [anthropic · claude-sonnet-5]
-[!secret NAME | !secrets | !fb <text> | tools | skills | skill <name> | team |
- identity | raw | history | cost | exit]
-
->
+> _
 ```
 
-`python3 agent.py` works from any shell, including one that has never heard of
-arcllm: if the interpreter that started it cannot import arcllm but `.venv` can,
-`agent.py` re-execs itself there. Only when it is the entrypoint, so
-`import agent` from another program is never hijacked.
+That's it. **Two dependencies.** No accounts to create, no services to configure,
+nothing running in the background. Everything stays on your machine.
+
+<details>
+<summary><b>Which API key do I need?</b></summary>
+
+<br>
+
+Any one of them. The default is Anthropic — get a key at
+[console.anthropic.com](https://console.anthropic.com). Paste it into `.env` next
+to `ANTHROPIC_API_KEY=`.
+
+Prefer something else? `python3 agent.py --provider openai` and paste an OpenAI
+key instead. Running a local model with Ollama needs no key at all.
+
+You pay the model provider directly for what you use. Type `cost` at any time to
+see what this session has spent.
+</details>
+
+<details>
+<summary><b>Is my data going anywhere?</b></summary>
+
+<br>
+
+Only what you type goes to the model provider you chose, same as any chat
+assistant. Everything the agent learns — its tools, its notes, your facts — is
+stored in plain files in this folder. Nothing is uploaded anywhere else, and
+there's no account or telemetry.
+
+Passwords and API keys you give it are stored separately with locked-down file
+permissions, handed to running code as environment variables, and scrubbed out of
+anything it says back to you. It never sees the values itself.
+</details>
 
 ---
 
-## The levers
+## The three things it builds
 
-| Meta-tool | What the model does with it |
-|---|---|
-| `grow_tool` | Drafts a new Python method from a description. Callable on the very next step. |
-| `grow_skill` | Writes durable instructions to itself, in prose, for judgment code cannot hold. |
-| `read_skill` | Loads one skill's full text, on demand. |
-| `forget_skill` | Deletes one that no longer holds. |
-| `update_identity` | Replaces its own system prompt, entirely. |
-| `create_specialist` | Promotes a family of tools and skills into a standing expert. |
-| `call_specialist` | Routes a task to one. |
-| `dissolve_specialist` | Retires one that has gone stale. |
-| `spawn_agent` | One-off sub-agent: assembled, run, gone. |
+Most assistants only have one of these. Having all three is what makes it
+compound.
 
-Everything else in its context is something it built.
+| | 🔧 **Tools** | 📘 **Notes to itself** | 🗂 **Facts** |
+|---|---|---|---|
+| **What it is** | Working code | Standing instructions | What's true in your world |
+| **Good for** | Anything exact and repeatable | Judgment and taste | Names, numbers, decisions |
+| **Example** | reads your ledger file | *"lead with the total, always give a lead time"* | *"Acme sells us steel — fast but pricey"* |
+
+Say all three at once and it sorts them out itself:
+
+```
+> When I ask you to price a job, always confirm the quantity and the deadline
+  first, and never quote without a lead time. I also need percent-change math.
+  And remember our main supplier is Acme.
+
+  ✎ note to itself   pricing_procedure     ← taste
+  ✎ built a tool     percent_change        ← exact math
+  ▸ saved a fact     supplier = Acme       ← something true
+```
+
+**It stays fast as it grows.** Only a one-line summary of each ability sits in
+front of it. The details load only when it actually reaches for one — so fifty
+abilities cost about as much as five.
 
 ---
 
-## Two kinds of growth
+## It corrects itself
 
-This is the part most agent designs get wrong by only having one.
+Two ways, and neither one asks you to touch code.
 
-**Tools are code.** Deterministic. Same input, same output, every time. Parsing,
-math, storage, formatting, API calls. Determinism is bedrock: never do in prose
-what code can do exactly.
-
-**Skills are prose.** Durable instructions the agent writes to itself for the
-part code cannot decide. A procedure worth repeating. House style. Domain rules.
-A checklist. A gotcha that cost it a mistake once.
+### 1. Just tell it when it's wrong
 
 ```
-> When I ask you to size a pump, always confirm flow rate, head, and fluid
-  type before quoting, and never quote without a lead time. Also I need
-  percent-change math on numbers. Set yourself up for both.
-
-  ok  grow_skill(pump_sizing_quote_procedure)
-  ok  grow_tool(percent_change)
+> !fb you already have a supplier lookup — use it before saying you don't know
 ```
 
-It split them itself. The procedure could not be code. The math should never be
-prose.
+One sentence. It marks that answer as wrong, treats your words as the final say,
+and has to go fix **whatever actually caused it** — the tool, the note, the saved
+data, or its own instructions. Not apologize. Fix.
 
-**Skills are cheap to carry.** Only the name and a one-line *when to use it* sit
-in the prompt. The body loads through `read_skill` when the moment arrives. Two
-skills cost about 190 characters of context no matter how long their bodies get.
-A library of fifty is still an index.
+### 2. It re-reads its own work
 
-**They compound.** The agent is told to write a skill the moment it catches
-itself re-deriving the same judgment, and to rewrite one whenever it learns
-something that would have made it better. The maintenance pass sees how often
-each skill was actually read, and is asked to sharpen the vague ones and forget
-the dead ones. Skills that never get read are visible; skills that carry the work
-get refined.
+Every few tasks it goes back over what you asked, what its tools returned, and
+what it told you, with one question in mind: **did you get what you wanted?**
+Something can technically work and still be wrong.
 
-```
-> skills                      # the index, with read counts
-> skill vendor_risk_review    # the full text
+Here's a real thing it caught on its own:
+
+> *"My supplier lookup and my customer lookup were both saving names to the same
+> place, so 'Acme Corp' was showing up as both a supplier and a customer. I
+> rewrote both to keep their records separate, made lookups forgiving about
+> capitals so 'acme' finds 'Acme Corp', and wrote myself a note so this can't
+> happen again."*
+
+Nobody told it. It found that by reading its own history.
+
+```mermaid
+flowchart TD
+    T["its own history<br/>what you asked · what it did · what it said"]
+    T --> Q{"did you get what<br/>you wanted?"}
+    Q --> R1["fix a tool"]
+    Q --> R2["write a note"]
+    Q --> R3["change how it<br/>builds things"]
+    Q --> R4["repair saved data"]
+
+    classDef t fill:#1a2740,stroke:#4f9cf9,color:#e8eefc
+    classDef q fill:#1e1a3a,stroke:#7c5cff,color:#e8eefc
+    classDef r fill:#16233c,stroke:#63d19e,color:#e8eefc
+    class T t
+    class Q q
+    class R1,R2,R3,R4 r
 ```
 
 ---
 
-## How growth works
+## It brings on specialists
 
+Once one area of your work builds up enough abilities, it promotes them into a
+**specialist** — a focused expert with its own instructions and its own memory.
+
+Those abilities then move *out* of the main assistant's head. So the more it
+learns, the more focused it stays.
+
+```mermaid
+flowchart TD
+    R["main assistant<br/>stays light"]
+    M[("everything it has built")]
+    S1["a specialist<br/>own instructions<br/>own memory"]
+    S2["another specialist<br/>own instructions<br/>own memory"]
+
+    M --- R
+    M --- S1
+    M --- S2
+    R -.->|"hands off a task"| S1
+    R -.->|"hands off a task"| S2
+
+    classDef root fill:#1a2740,stroke:#4f9cf9,color:#e8eefc
+    classDef reg fill:#0e1a30,stroke:#7c5cff,color:#e8eefc
+    classDef spec fill:#16233c,stroke:#3b567f,color:#e8eefc
+    class R root
+    class M reg
+    class S1,S2 spec
 ```
-model calls grow_tool("look up a company by name, fuzzy match")
-        ↓
-harness asks the model for {"name": ..., "code": "def ..."}
-        ↓
-compile() + "def <name>(" present?          ← rejected here if not
-        ↓
-manifest["lookup_company"] = code
-        ↓
-next turn: it is in the tool schema, and callable
-```
 
-Grown code gets full Python. Any import, `open()` inside its workspace, network
-if you passed `--allow-network`. It runs in a **subprocess**, not in the agent's
-process, with a 30 second timeout and a scrubbed environment.
-
-> **Sandbox honesty:** subprocess isolation stops *accidents* — hangs, crashes, a
-> tool casually reading the vault file. It does not stop malice: same user, same
-> filesystem. Container-wrap the identical runner before real stakes.
+Specialists don't run in the background or cost anything when idle. They're just
+there when a matching task comes up, remembering everything they've learned about
+that corner of your work.
 
 ---
 
-## The team model
+## Things to try on day one
 
-A mixture-of-experts that the agent assembles itself, built on one rule: **the
-root's context shrinks as the team grows.**
+Every line here is something you can type as-is.
 
+**Give it a memory**
 ```
-                    ┌──────────────────────────────┐
-                    │      ONE central registry    │   ← single source of truth
-                    │  every tool AND skill lives  │
-                    └──────────────┬───────────────┘
-                                   │
-              ┌────────────────────┼────────────────────┐
-              │                    │                    │
-       ┌──────▼──────┐      ┌──────▼──────┐     ┌───────▼───────┐
-       │ root context│      │ specialist  │     │  specialist   │
-       │ unassigned  │      │ 4 tools      │     │  6 tools      │
-       │ only        │      │ 2 skills    │     │  5 skills     │
-       └─────────────┘      │ own memory  │     │  own memory   │
-                            └─────────────┘     └───────────────┘
+> keep track of the people and companies I mention, and let me look them
+  up later even if I only remember part of the name
 ```
-
-- A specialist is a **persistent named view** over the registry: an identity, a
-  tool subset, a skill subset, and its own memory file that survives between
-  calls. That memory is what tunes over months.
-- Whatever a specialist owns **leaves the root's context** — tools drop out of
-  the schema, skills drop out of the index. That is the overload relief.
-- Between calls a specialist is just a registry entry. Nothing runs idle.
-- Anything a specialist grows or sharpens merges back into the central registry
-  under its ownership. No cross-specialist drift.
-- Specialists tune their own prompts too, and the tuned version persists.
-
-`spawn_agent` is the opposite: a one-off worker for a subtask. Its growth is
-*reported*, not kept.
-
-**One catch worth knowing:** a specialist can only be built from tools and skills
-that already exist. Ask for a specialist on day one and it has nothing to
-promote. Give it a few real tasks in that domain first, let it grow the pieces,
-then promote. Or just say so directly: *"grow the tools and skills for X, then
-promote them into a specialist."*
-
----
-
-## Memory
-
-One raw file per agent. No schema imposed.
-
-```python
-self._raw_read()            # -> str
-self._raw_write(content)    # str -> None
-```
-
-That is the entire interface. The model decides the format — JSON, prose,
-line-delimited records — and builds `save_fact`, `search_notes`, whatever it
-needs on top with `grow_tool`, then improves them as it learns what actually
-works.
-
-This is deliberate. A format the harness picks is a format the model is stuck
-with. A format the model picks is one it can outgrow.
-
----
-
-## Secrets
-
-Values never pass through chat.
-
-```
-> !secret STRIPE_KEY
-value for STRIPE_KEY (hidden, local-only): ••••••••
-[stored STRIPE_KEY — grown code reads it via self._secret('STRIPE_KEY')]
-```
-
-- Stored in `agent_workspace/.secrets.json`, mode `0600`.
-- Injected into the sandbox as `SECRET_*` env vars. The model never sees a value.
-- Every sandbox result is scanned on the way out. A leaked value comes back as
-  `[REDACTED:STRIPE_KEY]`.
-- One vault, harness-owned, shared by every specialist and sub-agent.
-
-This is what makes "go call that API for me" safe to say out loud.
-
----
-
-## How it learns
-
-Three mechanisms, in increasing order of force.
-
-**1. Traces.** Every tool call is recorded: name, arguments, whether it worked,
-and the first 200 characters of what came back. Harness failures all start with
-`FAILED: `, so success is unambiguous and nothing has to be guessed at. Type
-`history` to see what the agent sees.
-
-**2. Maintenance.** Every 25 tasks it runs itself through a review, and it is
-handed a digest of its own recent history: which tools it leans on, which have
-never been called, every call that failed and why, every correction you gave it.
-Then it merges redundant tools, repairs what broke, promotes families that have
-reached critical mass, dissolves specialists gone stale, and rewrites its
-identity to match reality.
-
-**3. Correction.** The blunt instrument.
-
-```
-> !fb you have a company lookup tool. use it before saying you have no record.
-```
-
-This marks the last task failed, records your words as ground truth, and runs one
-reconciliation turn where the agent must fix *whatever produced the error* —
-stored memory, a tool, a specialist, or its own prompt — so it stays fixed. Not
-apologize. Fix.
-
-One sentence from you becomes a permanent change in the system. That is the
-whole loop, and it is the highest-leverage thing in this repo.
-
----
-
-## Ideas: what to have it build for itself
-
-The agent starts empty on purpose. Here is what a first week can look like.
-Every line below is something you can literally type at the prompt.
-
-**Give it a memory worth having**
-
-```
-> build yourself a way to save facts about people and companies I mention,
-  and a way to search them by partial name
-> now add a way to list everything you know about one subject at once
-```
-
-Within three turns it has a personal CRM it designed itself, in whatever format
-it decided was right.
 
 **Point it at your files**
-
 ```
-> grow a tool that reads any CSV or JSON in ./workdir and describes its columns
-> now one that answers questions about a file by loading it and filtering
+> look at the spreadsheets in this folder and tell me what's in them
+> now let me ask questions about any of them
 ```
 
-It becomes a data analyst for exactly your file shapes, not a generic one.
+**Teach it your taste**
+```
+> when I paste meeting notes, pull out the decisions and who owns each one.
+  decisions first, no filler.
+```
 
-**Let it reach the network** (`--allow-network`)
-
+**Let it reach the web** (start with `python3 agent.py --allow-network`)
 ```
 > !secret GITHUB_TOKEN
-> build a tool that lists my open pull requests, then one that summarizes
-  what changed in each
+> show me my open pull requests and summarize what changed in each
 ```
 
-It writes its own API client. No SDK, no wrapper library, no integration to
-maintain.
-
-**Give it a routine**
-
+**Let it tidy up**
 ```
-> every time I paste a meeting note, extract the commitments and who owns them,
-  and save them. build whatever you need for that.
-> what am I on the hook for this week?
+> those note-taking abilities have piled up — turn them into a specialist
 ```
 
-**Teach it how you want things done**
+Other directions people take it: sorting the inbox, categorizing expenses,
+tracking a sales pipeline, watching a home server, keeping a reading pile,
+studying for something and remembering what you keep getting wrong.
 
-```
-> write yourself a skill for how I like meeting notes summarized: decisions
-  first, owners named, no filler
-> when you learn something new about how I work, update that skill
-```
-
-Skills are where your preferences live. Tools are where your determinism lives.
-
-**Then promote**
-
-```
-> those note tools and skills have piled up. promote them into a specialist
-  and give it a name.
-```
-
-Now that whole domain has its own prompt and its own memory, and it is out of
-the root agent's context.
-
-**Other directions people take it**
-
-- **Inbox triage** — classify, draft replies, remember who always needs a nudge
-- **Codebase janitor** — find dead code, stale TODOs, drifted docs, in your idioms
-- **Reading pile** — save articles, extract claims, connect them to old notes
-- **Money** — parse statements, categorize, notice when a subscription changes
-- **On-call helper** — remember which alerts were noise last time and why
-- **Job hunt / deal pipeline** — companies, contacts, stage, what was said
-- **Learning tutor** — track what you have covered, remember what you got wrong
-- **Home lab** — poll your own services, remember normal, tell you about weird
-
-The pattern is always the same. Tell it what you want in plain language. Let it
-build the tool. Correct it once when it is wrong. It stays corrected.
+The pattern never changes. **Say what you want. Let it build. Correct it once.**
 
 ---
 
-## Why arcllm
+## While you're at the prompt
 
-LLM calls go through [arcllm](https://github.com/joshuamschultz/Arc), a
-provider-agnostic client that never imports a vendor SDK. Every call is direct
-HTTP you can read.
-
-```bash
-python3 agent.py --provider openai
-python3 agent.py --provider google --model gemini-2.5-pro
-python3 agent.py --provider ollama        # fully local, air-gapped
-```
-
-Not one line of `agent.py` changes. The entire LLM layer is two methods:
-
-```python
-def _client(self):                     # long-lived, one connection pool
-    return load_model(self.provider, self.model, telemetry=True, retry=True)
-
-def _invoke(self, messages, tools):    # arcllm is async; the agent is not
-    resp = _sync(self._client().invoke(messages, tools, max_tokens=2000))
-    self.cost_usd += resp.cost_usd or 0.0
-    return resp
-```
-
-What comes with it, for free:
-
-- **Cost tracking.** Per call, rolled up from specialists and sub-agents into the
-  parent. Type `cost`.
-- **Retry.** Exponential backoff on 429s and 5xx, on by default.
-- **One response shape.** `content`, `tool_calls`, `stop_reason`, normalized across
-  every provider. The agent loop never sees a wire format.
-- **Opt-in modules.** PII redaction, request signing, audit events,
-  OpenTelemetry, rate limiting. Flip them on at `load_model()`. The agent code
-  is untouched.
-
-Measured overhead versus raw `httpx` to the same endpoint: none.
-
-### One gotcha worth stealing
-
-`agent.py` loads its `.env` with `override=True`, so the project's key beats
-whatever your shell exports. This was not paranoia. A shell exporting an *OpenAI*
-key under the name `ANTHROPIC_API_KEY` made every Anthropic call 401, and a
-configured fallback chain quietly answered with a different provider. Correct
-answers, wrong model, no error anywhere. A local `.env` that wins removes that
-entire class of bug.
+| Type this | To see |
+|---|---|
+| `tools` / `skills` | what it has built so far |
+| `skill <name>` | one of its notes, in full |
+| `team` | its specialists |
+| `identity` | its current instructions |
+| `history` | this session, the way it reviews it |
+| `review` | make it review itself right now |
+| `raw` | everything it has remembered |
+| `cost` | what you've spent this session |
+| `!fb <text>` | correct it — this is the important one |
+| `!secret NAME` | store a password or key, typed privately |
+| `new` | start a fresh conversation, keep everything it learned |
 
 ---
 
-## Configuration
+<details>
+<summary><h2 style="display:inline">For the technically curious</h2></summary>
+
+<br>
+
+**Three files, three jobs.**
+
+```
+agent.py     the harness — knows nothing about any model provider
+llm.py       the seam — one method, plain dicts. Swap it for litellm, raw HTTP, anything
+prompts.py   the words — seeded into state on first run, then the agent owns them
+```
+
+**Everything learned lives in `agent_state.json`** — tools, notes, prompts,
+identity, specialists, recent history. Delete it to start over. Edit it by hand
+to retune the agent. There is no database and no migration.
+
+**Grown code runs in a subprocess** with a timeout and a scrubbed environment.
+
+> That stops *accidents* — hangs, crashes, a tool wandering somewhere it
+> shouldn't. It does not stop malice: same user, same filesystem. Container-wrap
+> the runner before real stakes.
+
+**What it can change about itself**
+
+| Lever | What it does |
+|---|---|
+| `grow_tool` / `read_tool` | write a new tool, or read one back to repair it |
+| `grow_skill` / `read_skill` / `forget_skill` | write, load, or drop a standing instruction |
+| `update_identity` | rewrite its own system prompt |
+| `read_prompt` / `update_prompt` | rewrite how it drafts tools, or how it reviews itself |
+| `create_specialist` / `call_specialist` / `dissolve_specialist` | manage its team |
+| `spawn_agent` | one-off sub-agent, then gone |
+
+**Configuration**
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--provider` | `anthropic` | Any arcllm provider |
+| `--provider` | `anthropic` | any provider `llm.py` supports |
 | `--model` | provider default | e.g. `claude-opus-4-6` |
-| `--workspace` | `agent_workspace` | Memory, secrets, team dirs, trace log |
-| `--state` | `agent_state.json` | Tools, skills, identity, team, recent traces |
-| `--allow-network` | off | Grown code may make network calls |
-| `--allow-spawn` | off | Enables `spawn_agent` (max depth 2) |
+| `--workspace` | `agent_workspace` | memory, secrets, specialist dirs, trace log |
+| `--state` | `agent_state.json` | everything it has learned |
+| `--allow-network` | off | grown code may make network calls |
+| `--allow-spawn` | off | enables one-off sub-agents |
 
-Tuning constants sit at the top of `agent.py`: `MAX_TOOL_ITERS`,
-`MAX_SPAWN_DEPTH`, `MAINTENANCE_EVERY`, `SANDBOX_TIMEOUT`, `TRACES_IN_STATE`.
+Tuning constants sit at the top of `agent.py`: tool rounds per task, how often it
+reviews itself, how far back it looks.
 
-**Running for months.** Full history is appended to
-`agent_workspace/traces.jsonl`. Only the last 200 traces ride in
-`agent_state.json`, so the state file stays roughly fixed size no matter how long
-the agent has been alive. What actually grows is the tool manifest and the skill
-library — and specialists keep both out of the prompt, while skill bodies were
-never in it to begin with.
+**Running for months.** Full history appends to `agent_workspace/traces.jsonl`;
+only the recent tail rides in the state file, so it stays roughly fixed size.
+What grows is the library of abilities, and specialists keep that out of the
+prompt.
 
----
-
-## Where the seams are
-
-Stated plainly, because an agent that edits itself deserves an honest README.
-
-- **The sandbox stops accidents, not attackers.** Same user, same filesystem.
-- **A grown tool is only as good as its draft.** Validation is `compile()` plus a
-  signature check. It catches broken code, not wrong code. Wrong code gets caught
-  by `!fb`, one task later. That is the design, not an oversight, but you should
-  know which one you are relying on.
-- **Identity is fully replaceable, including by mistake.** `update_identity` is a
-  replacement, not an append. Prompt drift over hundreds of tasks is real. The
-  maintenance pass is the countermeasure, not a guarantee.
-- **A confident wrong answer still looks confident.** The agent will sometimes say
-  it has recorded something it did not record. The trace log is how you catch it,
-  and `!fb` is how you fix it. Check `history` when something feels off.
-- **State is one JSON file.** No migrations, no locking. Fine for one agent on one
-  machine, which is exactly what this is.
+</details>
 
 ---
 
-## License
+## Being straight with you
 
-MIT. Take it apart.
+An assistant that rewrites itself deserves an honest README.
+
+- **A new ability is only as good as its first draft.** The agent checks that the
+  code is valid, not that it's correct. Wrong code gets caught when you correct it
+  or when it reviews itself — one task later, not zero.
+- **It will occasionally say it saved something it didn't.** Type `history` when
+  something feels off. That log is how you catch it.
+- **It can rewrite its own instructions badly.** Self-review is the safeguard, not
+  a guarantee.
+- **This is one agent on one machine.** No accounts, no sync, no multi-user. That
+  simplicity is the point.
+
+---
+
+<p align="center"><sub>MIT. Take it apart.</sub></p>

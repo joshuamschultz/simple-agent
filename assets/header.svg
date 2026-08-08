@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 340" width="1200" height="340" role="img" aria-label="simple-agent - one class that builds its own harness as you use it">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="55%" stop-color="#111a2b"/>
+      <stop offset="100%" stop-color="#0a1020"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#4f9cf9"/>
+      <stop offset="100%" stop-color="#7c5cff"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#4f9cf9" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="#4f9cf9" stop-opacity="0"/>
+    </radialGradient>
+    <style>
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="340" rx="14" fill="url(#bg)"/>
+
+  <g stroke="#1e2b45" stroke-width="1" opacity="0.5">
+    <path d="M0 85 H1200"/><path d="M0 170 H1200"/><path d="M0 255 H1200"/>
+    <path d="M310 0 V340"/><path d="M620 0 V340"/><path d="M930 0 V340"/>
+  </g>
+
+  <circle cx="945" cy="170" r="215" fill="url(#glow)"/>
+
+  <text class="mono" x="72" y="112" font-size="58" font-weight="700"><tspan fill="#e8eefc">simple</tspan><tspan fill="url(#accent)">-agent</tspan></text>
+
+  <text class="sans" x="74" y="156" font-size="21" fill="#a9bcd8">One class that builds its own harness while you use it.</text>
+  <text class="sans" x="74" y="186" font-size="16" fill="#7f96b8">Tools, skills, prompts and identity — grown from your feedback and its own trace reviews.</text>
+  <text class="mono" x="74" y="216" font-size="14" fill="#61789c">the more you use it, the better it gets</text>
+
+  <g transform="translate(74,238)">
+    <rect x="0" y="0" width="640" height="74" rx="8" fill="#0b1220" stroke="#22304d"/>
+    <text class="mono" x="16" y="27" font-size="15" fill="#4f9cf9">&#62;</text>
+    <text class="mono" x="38" y="27" font-size="15" fill="#c6d5ea">how did Q3 close out?</text>
+    <text class="mono" x="38" y="50" font-size="12.5" fill="#7f96b8">grew <tspan fill="#63d19e">parse_ledger</tspan> &#183; called it &#183; wrote skill <tspan fill="#c9a2ff">margin_review</tspan></text>
+    <text class="mono" x="38" y="66" font-size="12.5" fill="#5f7593">next quarter it already knows how</text>
+  </g>
+
+  <g transform="translate(945,170)">
+    <g stroke="#31456b" stroke-width="1.6" fill="none">
+      <path d="M0 0 L-118 -80"/>
+      <path d="M0 0 L-96 64"/>
+      <path d="M0 0 L116 -86"/>
+      <path d="M0 0 L130 28"/>
+      <path d="M0 0 L34 116"/>
+      <path d="M0 0 L-38 -122"/>
+    </g>
+    <g fill="#16233c" stroke="#3b567f" stroke-width="1.4">
+      <circle cx="-118" cy="-80" r="15"/>
+      <circle cx="-96" cy="64" r="13"/>
+      <circle cx="116" cy="-86" r="14"/>
+      <circle cx="130" cy="28" r="12"/>
+      <circle cx="34" cy="116" r="13"/>
+      <circle cx="-38" cy="-122" r="11"/>
+    </g>
+    <circle r="44" fill="#0e1a30" stroke="url(#accent)" stroke-width="2.5"/>
+    <text class="mono" x="0" y="8" font-size="19" font-weight="700" text-anchor="middle" fill="#7fb2ff">{ }</text>
+  </g>
+</svg>

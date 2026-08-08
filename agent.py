@@ -50,8 +50,8 @@ import uuid
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-# The only thing this file knows about models: whether the seam imports. If it
-# doesn't, llm.py decides what to do about it.
+# The only thing this file knows about models: whether the seam imports.
+# If it doesn't, llm.py decides what to do about it.
 try:
     from llm import LLM, bootstrap, venv_handoff
     import prompts as _prompts_probe          # noqa: F401
@@ -98,7 +98,9 @@ class AgentShim:
             with open("memory.data") as f: return f.read()
         except FileNotFoundError: return ""
     def _raw_write(self, content):
-        with open("memory.data", "w") as f: f.write(content)
+        if not isinstance(content, str): content = json.dumps(content)
+        with open("memory.data.tmp", "w") as f: f.write(content)
+        os.replace("memory.data.tmp", "memory.data")
     def _secret(self, name):
         return os.environ.get("SECRET_" + name, "")
 import types as _t
@@ -179,10 +181,30 @@ class SelfBuildingAgent:
             return ""
 
     def _raw_write(self, content: str) -> None:
-        with open(os.path.join(self.workspace, "memory.data"), "w") as f:
+        """Write the store atomically: serialize, write a temp file, rename
+        over the original. A failure leaves the previous contents intact."""
+        if not isinstance(content, str):
+            content = json.dumps(content)
+        path = os.path.join(self.workspace, "memory.data")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
             f.write(content)
+        os.replace(tmp, path)
 
     # ---------------- sandboxed execution ----------------
+
+    @staticmethod
+    def _code(entry) -> str:
+        """A manifest entry is {'code', 'description'}. Older states stored
+        the code string alone; both are read through here."""
+        return entry["code"] if isinstance(entry, dict) else entry
+
+    @staticmethod
+    def _describe(entry) -> str:
+        if isinstance(entry, dict) and entry.get("description"):
+            return entry["description"]
+        m = _re.search(r'"""(.*?)"""', SelfBuildingAgent._code(entry), _re.S)
+        return " ".join(m.group(1).split()) if m else ""
 
     def _validate(self, code: str, fn_name: str) -> bool:
         try:
@@ -192,7 +214,8 @@ class SelfBuildingAgent:
         return f"def {fn_name}(" in code
 
     def _run_sandboxed(self, manifest: dict, fn_name: str, kwargs: dict) -> str:
-        runner = _RUNNER.format(manifest_code="\n\n".join(manifest.values()), fn_name=fn_name)
+        runner = _RUNNER.format(
+            manifest_code="\n\n".join(self._code(e) for e in manifest.values()), fn_name=fn_name)
         env = {"PATH": os.environ.get("PATH", ""),
                **{f"SECRET_{k}": v for k, v in self._secrets().items()}}
         try:
@@ -228,13 +251,11 @@ class SelfBuildingAgent:
 
     @staticmethod
     def _summary(doc: str) -> str:
-        """The always-loaded line for a grown tool.
+        """First paragraph of a docstring, capped, for the tool schema.
 
-        Same contract as a skill: the index entry says what it is and when to
-        reach for it; the full text loads on demand. A model-authored
-        docstring has no length limit, and the last review produced two of
-        1,300 characters each — which then shipped on every single turn.
-        """
+        Same contract as a skill: the summary is always loaded, the full text
+        loads on demand via read_tool. Model-authored docstrings have no
+        length limit, so the cap is what keeps the schema small."""
         first = doc.strip().split("\n\n")[0].strip()
         first = " ".join(first.split())
         if len(first) <= TOOL_SUMMARY_CHARS:
@@ -244,22 +265,18 @@ class SelfBuildingAgent:
         return (cut[:stop + 1] if stop > TOOL_SUMMARY_CHARS // 2 else cut.rstrip() + "...") \
             + " [read_tool for the full contract]"
 
-    def _tool_contract(self, name: str, code: str) -> str:
-        """One line describing a tool the way a caller needs it: how to call
-        it and what it promises. Never its body."""
-        sig = code.split("\n", 1)[0].strip()
+    def _tool_contract(self, name: str, entry) -> str:
+        """A tool as a caller needs it: how to call it, what it promises.
+        Never its body — that is what read_tool is for."""
+        sig = self._code(entry).split("\n", 1)[0].strip()
         sig = sig[4:-1] if sig.startswith("def ") and sig.endswith(":") else name
-        m = __import__("re").search(r'"""(.*?)"""', code, __import__("re").S)
-        doc = self._summary(m.group(1)) if m else ""
+        doc = self._summary(self._describe(entry))
         return f"- self.{sig}\n    {doc or '(no description)'}"
 
     def _draft_method(self, gap_description: str) -> dict:
         import re as _re
-        # The interface, not the implementation. A drafter that sees source
-        # code and stored bytes copies whatever shape was invented first —
-        # which is the shape from when the least was known. Names, signatures
-        # and contracts are what a caller actually needs, and they leave the
-        # author free to build something better than what is already there.
+        # Contracts, not source: a caller needs the interface, and seeing the
+        # existing implementation only anchors the new tool to its shape.
         existing = "\n".join(self._tool_contract(n, c) for n, c in self.manifest.items()) or "(none yet)"
         network = ("You may use urllib/sockets and any installed package to call APIs — network is enabled."
                    if self.allow_network else "No network calls.")
@@ -269,7 +286,9 @@ class SelfBuildingAgent:
         reply = self._complete("", [{"role": "user", "content": prompt}])
         cleaned = _re.sub(r"^```(?:json)?|```$", "", (reply["content"] or "").strip(),
                           flags=_re.MULTILINE).strip()
-        return json.loads(cleaned)
+        spec = json.loads(cleaned)
+        spec.setdefault("description", self._describe(spec.get("code", "")))
+        return spec
 
     # ---------------- meta-tools (the model's levers) ----------------
 
@@ -280,7 +299,9 @@ class SelfBuildingAgent:
             spec = self._draft_method(description)
             if not self._validate(spec["code"], spec["name"]):
                 return f"{FAILED}draft did not validate — try a more concrete description."
-            self.manifest[spec["name"]] = spec["code"]
+            self.manifest[spec["name"]] = {
+                "code": spec["code"],
+                "description": spec.get("description") or self._describe(spec["code"])}
             return f"Grew {spec['name']}. Callable from your next step."
         except Exception as e:
             return f"{FAILED}draft error: {e}"
@@ -289,10 +310,10 @@ class SelfBuildingAgent:
         """Read a grown tool's source. Do this before changing how something
         is stored or retrieved — grow_tool with the same name REPLACES it, so
         repairing the tool you have beats growing a second one beside it."""
-        code = self.manifest.get(name)
-        if not code:
+        entry = self.manifest.get(name)
+        if not entry:
             return f"{FAILED}no tool named '{name}'. You have: {list(self.manifest)}"
-        return code
+        return f"{name} — {self._describe(entry)}\n\n{self._code(entry)}"
 
     def grow_skill(self, name: str, when_to_use: str, body: str) -> str:
         """Write or rewrite a SKILL: durable instructions for yourself, in
@@ -474,16 +495,18 @@ class SelfBuildingAgent:
     def _tools_schema(self) -> list[dict]:
         schema = [self._schema_for(name, getattr(self, name)) for name in self._meta_names()]
         assigned = self._assigned_tools() if self._spawn_depth == 0 else set()
-        for name, code in self.manifest.items():
+        for name, entry in self.manifest.items():
             if name in assigned:
                 continue  # a specialist owns it — out of the root's context
             try:
                 ns: dict = {}
-                exec(compile(code, "<schema>", "exec"), {"__builtins__": {}}, ns)
+                exec(compile(self._code(entry), "<schema>", "exec"), {"__builtins__": {}}, ns)
                 fn = ns.get(name)
                 if not fn:
                     continue
-                schema.append(self._schema_for(name, fn, skip_self=True))
+                tool = self._schema_for(name, fn, skip_self=True)
+                tool["description"] = self._summary(self._describe(entry)) or tool["description"]
+                schema.append(tool)
             except Exception:
                 continue
         return schema
@@ -527,9 +550,8 @@ class SelfBuildingAgent:
         for _ in range(MAX_TOOL_ITERS):
             reply = self._complete(self._build_system(), messages, self._tools_schema())
             if reply["stop_reason"] != "tool_use":
-                # A turn cut off at the token cap used to come back as an empty
-                # string and get filed as a success. Say so instead, and let
-                # run() record it as the failure it is.
+                # A turn cut off at the token cap has no usable answer; name
+                # it so run() records the task as failed.
                 if reply["stop_reason"] == "max_tokens" and not reply["content"]:
                     answer = f"[no final answer — hit the {MAX_TOKENS} token cap mid-response]"
                 else:
@@ -566,12 +588,8 @@ class SelfBuildingAgent:
         return "[no final answer — exceeded tool-use iteration budget]", calls
 
     def _trim_conversation(self) -> None:
-        """Bound the running conversation, cutting only at user turns.
-
-        Anthropic requires every tool_use block to be answered by a
-        tool_result, so a trim that lands mid-exchange produces an API error.
-        Dropping whole exchanges from the front is the only safe cut.
-        """
+        """Trim the conversation to CONTEXT_MESSAGES, dropping whole exchanges
+        from the front. Cutting mid-exchange would orphan a tool call."""
         while len(self.messages) > CONTEXT_MESSAGES:
             del self.messages[0]
             while self.messages and self.messages[0]["role"] != "user":
@@ -593,16 +611,9 @@ class SelfBuildingAgent:
         return trace
 
     def _session_review(self, limit: int = REVIEW_WINDOW) -> str:
-        """The recent session, verbatim, for review.
-
-        Counts and error rates describe whether the machinery ran. They say
-        nothing about whether the user got what they asked for — and that is
-        the only question worth reviewing. So this hands back the actual
-        exchange: what was asked, what was answered, what the tools returned.
-        A question asked twice, an answer the tool results don't support, two
-        tools returning the same list: all of it is visible in the transcript
-        and none of it is visible in a tally.
-        """
+        """Render the recent session verbatim: each task, the tool calls it
+        made with their results, and the answer given. Counts say whether the
+        machinery ran; only the transcript shows whether the user was served."""
         recent = [t for t in self.traces[-limit:] if t["task"] != "[maintenance]"]
         if not recent:
             return "(no session yet)"
@@ -630,13 +641,8 @@ class SelfBuildingAgent:
         return "\n".join(out)
 
     def _act_review(self):
-        """The periodic review.
-
-        Deliberately short. A long instruction list produced an empty answer;
-        the same transcript with one blunt question produced the actual root
-        cause in a sentence. The transcript carries the evidence, so the
-        prompt only has to ask the right thing of it.
-        """
+        """The periodic review: hand the model its own transcript and ask one
+        question of it. Runs isolated, so it never joins the conversation."""
         return self.act(
             self.prompts["review"].format(
                 REVIEW_WINDOW=REVIEW_WINDOW, transcript=self._session_review()),
@@ -656,9 +662,7 @@ class SelfBuildingAgent:
         self._record(task, calls, output, success)
         if self._spawn_depth == 0:
             self.tasks_since_maintenance += 1
-            # Cadence OR signal. Two corrections in a row means something is
-            # wrong now, and waiting another twenty tasks to look at it is how
-            # a small misunderstanding becomes a habit.
+            # Cadence or signal: corrections pull the review forward.
             if (self.tasks_since_maintenance >= REVIEW_EVERY
                     or self.corrections_since_review >= CORRECTIONS_BEFORE_REVIEW):
                 self.tasks_since_maintenance = 0
@@ -702,17 +706,22 @@ class SelfBuildingAgent:
     def load(self, path: str):
         with open(path) as f:
             data = json.load(f)
-        self.manifest = {n: c for n, c in data.get("manifest", {}).items() if self._validate(c, n)}
+        # Lift legacy bare-code entries into {code, description}.
+        self.manifest = {}
+        for n, entry in data.get("manifest", {}).items():
+            code = self._code(entry)
+            if self._validate(code, n):
+                self.manifest[n] = {"code": code, "description": self._describe(entry)}
         self.skills = data.get("skills", {})
         # Saved prompts win; anything this build added that the state predates
         # is filled in from the defaults, so upgrades are never lost.
+        # Seeded from prompts.py, owned by the agent from then on. Defaults
+        # only fill keys this state has never seen. Delete state for stock.
         self.prompts = {**DEFAULT_PROMPTS, **data.get("prompts", {})}
         if "identity" in data:          # state written before identity moved in
             self.prompts["identity"] = data["identity"]
         self.team = data.get("team", {})
         self.traces = data.get("traces", [])[-TRACES_IN_STATE:]
-        # Without this the counter reset on every restart and the review
-        # simply never fired.
         # The conversation is deliberately NOT restored. A restart is a clean
         # slate for the thread; what persists is what was learned — tools,
         # skills, memory, identity.
