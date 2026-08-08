@@ -27,10 +27,9 @@ Team model (mixture-of-experts):
 - Ad-hoc spawn_agent stays for one-off subtasks: assembled, run, wound
   down, nothing registered.
 
-LLM calls go through arcllm — one provider-agnostic client, direct HTTP, no
-vendor SDK. Swap `--provider openai` (or google, groq, ollama, ...) and
-nothing else in this file changes. Retry, telemetry (per-call USD cost),
-PII redaction and audit are arcllm modules, toggled at load_model().
+The model lives behind llm.py — one method, plain dicts, no provider types
+in this file. Swap that file for litellm, a raw client, anything, and
+nothing here changes.
 
 Run:  export ANTHROPIC_API_KEY=...  &&  python3 agent.py
 Sandbox note: subprocess isolation stops accidents (hangs, crashes, casual
@@ -39,11 +38,10 @@ identical runner before real stakes.
 """
 
 from __future__ import annotations
-import asyncio
-import importlib.util
 import inspect
 import json
 import os
+import re as _re
 import stat
 import subprocess
 import sys
@@ -52,33 +50,31 @@ import uuid
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-# `python3 agent.py` from any shell should just work. If the interpreter that
-# started us can't see arcllm but this project's venv can, hand off to it.
-if importlib.util.find_spec("arcllm") is None:
-    _venv_dir = os.path.join(_HERE, ".venv")
-    _venv = os.path.join(_venv_dir, "bin", "python")
-    # Only when THIS file is the entrypoint — re-execing on an `import agent`
-    # would replace the caller's program with our REPL.
-    _entry = os.path.realpath(sys.argv[0] or "") == os.path.realpath(__file__)
-    # Compare prefixes, not interpreter paths: a uv venv's `python` is a
-    # symlink to the base interpreter, so realpath() would call them equal.
-    if _entry and os.path.exists(_venv) and os.path.realpath(sys.prefix) != os.path.realpath(_venv_dir):
-        os.execv(_venv, [_venv, os.path.abspath(__file__), *sys.argv[1:]])
-    sys.exit("arcllm not found. Run ./setup.sh once, then `python3 agent.py`.")
+# The only thing this file knows about models: whether the seam imports. If it
+# doesn't, llm.py decides what to do about it.
+try:
+    from llm import LLM, bootstrap, venv_handoff
+    import prompts as _prompts_probe          # noqa: F401
+except ImportError:
+    try:
+        from llm import venv_handoff          # deps missing, seam still importable
+        venv_handoff(__file__)
+    except ImportError:                       # the seam itself can't load
+        _venv = os.path.join(_HERE, ".venv", "bin", "python")
+        if os.path.realpath(sys.argv[0] or "") == os.path.realpath(__file__) \
+                and os.path.exists(_venv) \
+                and os.path.realpath(sys.prefix) != os.path.realpath(os.path.join(_HERE, ".venv")):
+            os.execv(_venv, [_venv, os.path.abspath(__file__), *sys.argv[1:]])
+        sys.exit("Not set up yet. Run ./setup.sh once, then `python3 agent.py`.")
 
-from dotenv import load_dotenv  # noqa: E402
+from prompts import DEFAULT_PROMPTS  # noqa: E402
 
-# This project's .env wins over whatever the shell exports — a stale or
-# mislabelled key in the environment otherwise silently 401s and (with a
-# fallback chain configured) gets answered by a different provider entirely.
-load_dotenv(os.path.join(_HERE, ".env"), override=True)
-
-from arcllm import (LLMResponse, Message, TextBlock, Tool, ToolResultBlock,  # noqa: E402
-                    ToolUseBlock, load_model)
+bootstrap(__file__)
 
 MAX_TOKENS = 50000         # a cap, not a charge — only real output tokens bill
 MAX_TOOL_ITERS = 24
 CONTEXT_MESSAGES = 60      # running conversation kept in front of the model
+TOOL_SUMMARY_CHARS = 220   # of a grown tool's docstring, what rides in every turn
 MAX_SPAWN_DEPTH = 2
 REVIEW_EVERY = 5                # review often; patterns hide in the gaps
 REVIEW_WINDOW = 50              # but always look back further than you review
@@ -93,38 +89,6 @@ FAILED = "FAILED: "
 
 _JSON_TYPE = {str: "string", int: "integer", float: "number", bool: "boolean",
               list: "array", dict: "object"}
-
-_LOOP: asyncio.AbstractEventLoop | None = None
-
-
-def _sync(coro):
-    """Run one arcllm coroutine from this synchronous agent.
-
-    A single long-lived loop, not asyncio.run() per call — the adapter's
-    httpx connection pool is bound to the loop that created it.
-    """
-    global _LOOP
-    if _LOOP is None or _LOOP.is_closed():
-        _LOOP = asyncio.new_event_loop()
-    return _LOOP.run_until_complete(coro)
-
-SEED_IDENTITY = """You are an agent that builds its own capabilities, memory, team, and even this system prompt as tasks require.
-
-Storage: grown code can call self._raw_read() / self._raw_write(content) on your one raw storage file — you decide the format, and you are expected to keep changing it. The shape you pick on day one is the shape you understood least; when what you're storing outgrows it, migrate every record into a better one rather than bolting the new thing onto the old. Read a storage tool with read_tool before you change how anything is stored, and replace it under the same name. Secrets: grown code reads credentials via self._secret("NAME"); never ask users to paste secret values into chat — they use the local !secret command.
-
-You grow in TWO ways, and picking the right one matters:
-
-TOOLS (grow_tool) are Python. Use one whenever the work is deterministic — the same input must always give the same output. Parsing, math, storage, formatting, calling an API. Never do in prose what code can do exactly. Grown code has full Python: any import, open() in your workspace, network if enabled. It's callable on your next step.
-
-SKILLS (grow_skill) are durable instructions to yourself, in prose, for the parts code can't decide: a procedure worth repeating, house style, domain rules, a checklist, a gotcha that cost you a mistake once. Write a skill the moment you notice yourself re-deriving the same judgment, and rewrite it whenever you learn something that would have made it better. Only each skill's name and when_to_use sit in your prompt; read_skill loads the full text, so read one BEFORE doing the work it covers, not after. Because bodies load on demand, a large skill library costs you almost nothing to carry.
-
-The pairing is the point: a skill says how to think about vendor risk, a tool computes the score. Neither substitutes for the other.
-
-Team: when a family of tools and skills around one domain (vendors, customers, inventory...) reaches critical mass, promote it: create_specialist registers a standing expert with its own prompt, tool subset, skill subset, and persistent memory — all of it leaves your context, keeping you fast. Route matching tasks to it with call_specialist. Dissolve stale specialists; their tools and skills return to you. For one-off subtasks use spawn_agent — assembled, run, gone, nothing registered. Your skill index and team roster are appended below this prompt each turn.
-
-This prompt is yours: update_identity replaces it entirely. It's sent every turn — keep it short and current; record what you've built and where things live.
-
-Every tool result either worked or begins with "FAILED: ". A FAILED result is information, not noise — read it, fix the cause, and don't repeat the same call. Your recent history, including which calls failed and every correction the user has given you, is summarized for you during maintenance. A correction is ground truth — reconcile whatever produced the error."""
 
 _RUNNER = '''
 import json, os, sys
@@ -150,26 +114,26 @@ print("__RESULT__" + json.dumps({{"result": str(_r)}}))
 
 class SelfBuildingAgent:
     _META_ROOT = ("grow_tool", "read_tool", "grow_skill", "read_skill", "forget_skill",
-                   "update_identity", "create_specialist", "call_specialist",
-                   "dissolve_specialist", "spawn_agent")
+                   "update_identity", "read_prompt", "update_prompt", "create_specialist",
+                   "call_specialist", "dissolve_specialist", "spawn_agent")
     _META_CHILD = ("grow_tool", "read_tool", "grow_skill", "read_skill",
                     "update_identity", "spawn_agent")
 
     def __init__(self, client=None, workspace: str = "agent_workspace",
                  allow_network: bool = False, allow_spawn: bool = False,
                  provider: str = "anthropic", model: str | None = None):
-        self.client = client          # an arcllm LLMProvider; built lazily if None
+        self.client = client          # an llm.LLM; built lazily if None
         self.provider = provider
         self.model = model            # None -> provider's default_model
         self.cost_usd = 0.0
         self.workspace = workspace
         os.makedirs(workspace, exist_ok=True)
-        self.identity = SEED_IDENTITY
+        self.prompts: dict[str, str] = dict(DEFAULT_PROMPTS)
         self.manifest: dict[str, str] = {}          # ALL grown tools, central
         self.skills: dict[str, dict] = {}           # name -> {when, body, uses}
         self.team: dict[str, dict] = {}             # name -> {identity, tools, skills, description}
         self.traces: list[dict] = []
-        self.messages: list[Message] = []      # the live conversation
+        self.messages: list[dict] = []         # the live conversation
         self.allow_network = allow_network
         self.allow_spawn = allow_spawn
         self.tasks_since_maintenance = 0
@@ -248,38 +212,45 @@ class SelfBuildingAgent:
             return self._redact(combined)
         return self._redact(f"{FAILED}{(proc.stderr or 'no output').strip()[-800:]}")
 
-    # ---------------- LLM calls via arcllm ----------------
+    # ---------------- the model ----------------
 
     def _client(self):
-        """The arcllm model object. Long-lived — one connection pool, shared
-        with every specialist and sub-agent this agent creates."""
+        """Long-lived — one connection pool, shared with every specialist
+        and sub-agent this agent creates."""
         if self.client is None:
-            opts = {"telemetry": True,   # per-call USD cost
-                    "retry": True}       # backoff on 429/5xx
-            # agent_label labels traces per agent; older arcllm releases don't
-            # take it, and it isn't worth pinning a version over.
-            if "agent_label" in inspect.signature(load_model).parameters:
-                opts["agent_label"] = f"selfbuilder:{self.workspace}"
-            self.client = load_model(self.provider, self.model, **opts)
+            self.client = LLM(self.provider, self.model, label=f"selfbuilder:{self.workspace}")
         return self.client
 
-    def _invoke(self, messages: list[Message], tools: list[Tool] | None = None) -> LLMResponse:
-        resp = _sync(self._client().invoke(messages, tools or None, max_tokens=MAX_TOKENS))
-        self.cost_usd += resp.cost_usd or 0.0
-        return resp
+    def _complete(self, system: str, messages: list[dict], tools: list[dict] | None = None) -> dict:
+        reply = self._client().complete(system, messages, tools, max_tokens=MAX_TOKENS)
+        self.cost_usd += reply["cost_usd"] or 0.0
+        return reply
 
-    def _complete(self, system: str, messages: list[Message], tools: list[Tool]) -> LLMResponse:
-        return self._invoke([Message(role="system", content=system), *messages], tools)
+    @staticmethod
+    def _summary(doc: str) -> str:
+        """The always-loaded line for a grown tool.
+
+        Same contract as a skill: the index entry says what it is and when to
+        reach for it; the full text loads on demand. A model-authored
+        docstring has no length limit, and the last review produced two of
+        1,300 characters each — which then shipped on every single turn.
+        """
+        first = doc.strip().split("\n\n")[0].strip()
+        first = " ".join(first.split())
+        if len(first) <= TOOL_SUMMARY_CHARS:
+            return first
+        cut = first[:TOOL_SUMMARY_CHARS]
+        stop = max(cut.rfind(". "), cut.rfind("; "))
+        return (cut[:stop + 1] if stop > TOOL_SUMMARY_CHARS // 2 else cut.rstrip() + "...") \
+            + " [read_tool for the full contract]"
 
     def _tool_contract(self, name: str, code: str) -> str:
         """One line describing a tool the way a caller needs it: how to call
         it and what it promises. Never its body."""
         sig = code.split("\n", 1)[0].strip()
         sig = sig[4:-1] if sig.startswith("def ") and sig.endswith(":") else name
-        doc = ""
         m = __import__("re").search(r'"""(.*?)"""', code, __import__("re").S)
-        if m:
-            doc = " ".join(m.group(1).split())
+        doc = self._summary(m.group(1)) if m else ""
         return f"- self.{sig}\n    {doc or '(no description)'}"
 
     def _draft_method(self, gap_description: str) -> dict:
@@ -292,41 +263,11 @@ class SelfBuildingAgent:
         existing = "\n".join(self._tool_contract(n, c) for n, c in self.manifest.items()) or "(none yet)"
         network = ("You may use urllib/sockets and any installed package to call APIs — network is enabled."
                    if self.allow_network else "No network calls.")
-        prompt = f"""A capability gap: {gap_description}
-
-Tools that already exist. Call any of them from your code as self.<name>(...):
-{existing}
-
-If one of those already owns this job, the right move is usually to REPLACE it:
-draft under its exact name and yours supersedes it. Do that rather than adding a
-near-duplicate beside it.
-
-Storage: self._raw_read() and self._raw_write(content) share ONE store across
-every tool. So read it, change only the part your tool owns, and write the whole
-thing back — never blank another tool's data. Give what you own its own
-namespace, and put a type on records rather than leaving different kinds of
-thing jumbled together at the top level. If you are replacing a storage tool and
-the old shape was wrong, migrate it: read every existing record, move it into
-the better shape, write it back. Nothing already stored may be lost. The store
-is expected to keep improving; it should never be frozen at whatever the first
-tool happened to invent.
-
-Also available: self._secret(name) for credentials. Full Python — any import,
-open() on files. {network}
-
-Never assume a working directory. If your tool touches a path, take that path as
-a parameter so the caller supplies it.
-
-Make every action work on its own: a parameter only some actions need must have
-a default, never be required.
-
-Respond with ONLY a JSON object, no prose, no fences:
-{{"name": "<snake_case_name>", "code": "def <name>(self, <typed params>) -> <type>:\\n    \\"\\"\\"<one line: what it does, when to call it, and what it owns in the store>\\"\\"\\"\\n    <body>"}}
-The docstring is the ONLY thing other tools and future drafts will see about
-this tool, so make it a contract, not a label.
-First parameter must be self. Type-hint every parameter (str/int/float/bool/list/dict)."""
-        resp = self._invoke([Message(role="user", content=prompt)])
-        cleaned = _re.sub(r"^```(?:json)?|```$", "", (resp.content or "").strip(),
+        prompt = self.prompts["draft"].format(
+            gap_description=gap_description, existing=existing, network=network,
+            TOOL_SUMMARY_CHARS=TOOL_SUMMARY_CHARS)
+        reply = self._complete("", [{"role": "user", "content": prompt}])
+        cleaned = _re.sub(r"^```(?:json)?|```$", "", (reply["content"] or "").strip(),
                           flags=_re.MULTILINE).strip()
         return json.loads(cleaned)
 
@@ -382,11 +323,43 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
         del self.skills[name]
         return f"Forgot skill '{name}'."
 
+    @property
+    def identity(self) -> str:
+        return self.prompts["identity"]
+
+    @identity.setter
+    def identity(self, value: str) -> None:
+        self.prompts["identity"] = value
+
     def update_identity(self, new_identity: str) -> str:
         """Replace your entire system prompt. Full replacement, not append —
         carry forward what still matters. Takes effect next turn."""
-        self.identity = new_identity
+        self.prompts["identity"] = new_identity
         return f"Identity updated ({len(new_identity)} chars)."
+
+    def read_prompt(self, name: str) -> str:
+        """Read one of the harness prompts that drives you: 'identity' (your
+        system prompt), 'draft' (how new tools get written), 'review' (how you
+        review your own work). Read before rewriting."""
+        if name not in self.prompts:
+            return f"{FAILED}no prompt named '{name}'. You have: {list(self.prompts)}"
+        return self.prompts[name]
+
+    def update_prompt(self, name: str, text: str) -> str:
+        """Rewrite one of the harness prompts. This is the deepest lever you
+        have: 'draft' decides how every future tool gets written, 'review'
+        decides how you judge your own work. Sharpen them when the review
+        shows they produced a bad tool or missed a real problem. Placeholders
+        in the original must survive, or the prompt cannot be filled in."""
+        if name not in self.prompts:
+            return f"{FAILED}no prompt named '{name}'. You have: {list(self.prompts)}"
+        missing = [ph for ph in _re.findall(r"\{(\w+)\}", DEFAULT_PROMPTS.get(name, ""))
+                   if "{" + ph + "}" not in text]
+        if missing:
+            return (f"{FAILED}your version drops the placeholders {missing}, which the harness "
+                    f"fills in. Keep every one of them and try again.")
+        self.prompts[name] = text
+        return f"Rewrote the '{name}' prompt ({len(text)} chars). It takes effect immediately."
 
     def create_specialist(self, name: str, identity: str, tools: list, description: str,
                           skills: list = None) -> str:
@@ -476,7 +449,7 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
         return [n for n in names if n != "spawn_agent" or
                 (self.allow_spawn and self._spawn_depth < MAX_SPAWN_DEPTH)]
 
-    def _schema_for(self, name: str, fn, skip_self=False) -> Tool:
+    def _schema_for(self, name: str, fn, skip_self=False) -> dict:
         sig = inspect.signature(fn)
         props, required = {}, []
         for pname, param in sig.parameters.items():
@@ -487,8 +460,10 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
             if param.default is inspect.Parameter.empty:
                 required.append(pname)
         doc = (inspect.getdoc(fn) or "").strip() or f"Call {name}."
-        return Tool(name=name, description=doc,
-                    parameters={"type": "object", "properties": props, "required": required})
+        if skip_self:                      # a grown tool — model-authored, unbounded
+            doc = self._summary(doc)
+        return {"name": name, "description": doc,
+                "parameters": {"type": "object", "properties": props, "required": required}}
 
     def _assigned_tools(self) -> set:
         out = set()
@@ -496,7 +471,7 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
             out.update(spec["tools"])
         return out
 
-    def _tools_schema(self) -> list[Tool]:
+    def _tools_schema(self) -> list[dict]:
         schema = [self._schema_for(name, getattr(self, name)) for name in self._meta_names()]
         assigned = self._assigned_tools() if self._spawn_depth == 0 else set()
         for name, code in self.manifest.items():
@@ -544,45 +519,48 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
         the session without becoming part of it.
         """
         if fresh:
-            messages: list[Message] = [Message(role="user", content=task)]
+            messages: list[dict] = [{"role": "user", "content": task}]
         else:
-            self.messages.append(Message(role="user", content=task))
+            self.messages.append({"role": "user", "content": task})
             messages = self.messages
         calls: list[dict] = []
         for _ in range(MAX_TOOL_ITERS):
-            resp = self._complete(self._build_system(), messages, self._tools_schema())
-            if resp.stop_reason != "tool_use":
+            reply = self._complete(self._build_system(), messages, self._tools_schema())
+            if reply["stop_reason"] != "tool_use":
                 # A turn cut off at the token cap used to come back as an empty
                 # string and get filed as a success. Say so instead, and let
                 # run() record it as the failure it is.
-                if resp.stop_reason == "max_tokens" and not resp.content:
+                if reply["stop_reason"] == "max_tokens" and not reply["content"]:
                     answer = f"[no final answer — hit the {MAX_TOKENS} token cap mid-response]"
                 else:
-                    answer = resp.content or ""
+                    answer = reply["content"] or ""
                 if not fresh:
-                    messages.append(Message(role="assistant", content=answer or "(no answer)"))
+                    messages.append({"role": "assistant", "content": answer or "(no answer)"})
                     self._trim_conversation()
                 return answer, calls
-            blocks = ([TextBlock(text=resp.content)] if resp.content else []) + [
-                ToolUseBlock(id=c.id, name=c.name, arguments=c.arguments) for c in resp.tool_calls]
-            messages.append(Message(role="assistant", content=blocks))
+            blocks = ([{"type": "text", "text": reply["content"]}] if reply["content"] else []) + [
+                {"type": "tool_use", "id": c["id"], "name": c["name"], "arguments": c["arguments"]}
+                for c in reply["tool_calls"]]
+            messages.append({"role": "assistant", "content": blocks})
             tool_results = []
             meta = set(self._meta_names())
-            for call in resp.tool_calls:
+            for call in reply["tool_calls"]:
+                name, args = call["name"], call["arguments"]
                 try:
-                    if call.name in meta:
-                        result = getattr(self, call.name)(**call.arguments)
-                    elif call.name in self.manifest:
-                        result = self._run_sandboxed(self.manifest, call.name, call.arguments)
+                    if name in meta:
+                        result = getattr(self, name)(**args)
+                    elif name in self.manifest:
+                        result = self._run_sandboxed(self.manifest, name, args)
                     else:
-                        result = f"{FAILED}no such tool: {call.name}"
+                        result = f"{FAILED}no such tool: {name}"
                 except Exception as e:
                     result = f"{FAILED}{type(e).__name__}: {e}"
                 result = str(result)
-                calls.append({"tool": call.name, "ok": not result.startswith(FAILED),
-                              "args": call.arguments, "result": result[:200]})
-                tool_results.append(ToolResultBlock(tool_use_id=call.id, content=result))
-            messages.append(Message(role="tool", content=tool_results))
+                calls.append({"tool": name, "ok": not result.startswith(FAILED),
+                              "args": args, "result": result[:200]})
+                tool_results.append({"type": "tool_result", "tool_use_id": call["id"],
+                                      "content": result})
+            messages.append({"role": "tool", "content": tool_results})
         if not fresh:
             self._trim_conversation()
         return "[no final answer — exceeded tool-use iteration budget]", calls
@@ -596,7 +574,7 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
         """
         while len(self.messages) > CONTEXT_MESSAGES:
             del self.messages[0]
-            while self.messages and self.messages[0].role != "user":
+            while self.messages and self.messages[0]["role"] != "user":
                 del self.messages[0]
 
     # ---------------- traces ----------------
@@ -651,53 +629,6 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
                 f"{n} {s.get('uses', 0)}x" for n, s in self.skills.items()))
         return "\n".join(out)
 
-    def _trace_digest(self, limit: int = 25) -> str:
-        """Recent history, compressed, for the maintenance pass to read.
-
-        The maintenance prompt has always asked the agent to review its
-        traces; without this the traces were never actually in the prompt.
-        Failures are listed verbatim because they are the whole point.
-        """
-        recent = [t for t in self.traces[-limit:] if t["task"] != "[maintenance]"]
-        if not recent:
-            return "(no history yet)"
-        usage: dict[str, list[int]] = {}
-        failures, corrections = [], []
-        for t in recent:
-            for c in t.get("calls", []):
-                tally = usage.setdefault(c["tool"], [0, 0])
-                tally[0] += 1
-                if not c["ok"]:
-                    tally[1] += 1
-                    failures.append(f'  {c["tool"]}({json.dumps(c["args"])[:80]}) -> {c["result"][:110]}')
-            if t.get("correction"):
-                corrections.append(f'  task {t["task"][:60]!r} -> user said: {t["correction"][:110]}')
-        lines = [f"Last {len(recent)} tasks."]
-        if usage:
-            lines.append("Tool use (calls/failed): " + ", ".join(
-                f"{n} {c[0]}/{c[1]}" for n, c in sorted(usage.items(), key=lambda kv: -kv[1][0])))
-        unused = [n for n in self.manifest if n not in usage]
-        if unused:
-            lines.append(f"Tools never called in this window: {', '.join(unused)}")
-        if self.skills:
-            lines.append("Skills (lifetime reads): " + ", ".join(
-                f"{n} {s.get('uses', 0)}" for n, s in self.skills.items()))
-        repeats: dict[str, int] = {}
-        for t in recent:
-            for c in t.get("calls", []):
-                if c["tool"] == "grow_tool":
-                    repeats[str(c["args"])[:60]] = repeats.get(str(c["args"])[:60], 0) + 1
-        if any(v > 1 for v in repeats.values()):
-            lines.append("You grew near-identical tools more than once — that is a skill "
-                          "waiting to be written, or a tool waiting to be generalized.")
-        if failures:
-            lines.append("FAILED CALLS — fix the cause, do not repeat them:")
-            lines.extend(failures[-12:])
-        if corrections:
-            lines.append("User corrections (ground truth):")
-            lines.extend(corrections[-5:])
-        return "\n".join(lines)
-
     def _act_review(self):
         """The periodic review.
 
@@ -707,19 +638,8 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
         prompt only has to ask the right thing of it.
         """
         return self.act(
-            f"REVIEW — your last {REVIEW_WINDOW} exchanges, verbatim. What the user asked, what "
-            f"your tools returned, what you answered.\n\n{self._session_review()}\n\n"
-            "Read the whole run, not one exchange at a time. The problems worth fixing only show "
-            "up across exchanges: a question asked twice, a rephrase, a correction, an answer the "
-            "tool results never supported, two tools returning the same data, a lookup that misses "
-            "a name that is plainly there, judgment you worked out once and then worked out again.\n\n"
-            "One question: WHERE DID THE USER NOT GET WHAT THEY WANTED? A call can succeed and "
-            "still be wrong.\n\n"
-            "Then fix the cause so it cannot recur — read_tool and replace a broken tool under its "
-            "own name, migrate the store if its shape no longer fits, grow_skill so a judgment "
-            "survives, repair data a bad tool corrupted, promote or dissolve a specialist, "
-            "update_identity to match what actually exists.\n\n"
-            "Finish with 2-3 plain sentences to the user: what you got wrong, what is different now.",
+            self.prompts["review"].format(
+                REVIEW_WINDOW=REVIEW_WINDOW, transcript=self._session_review()),
             fresh=True)
 
     def review(self) -> dict:
@@ -761,7 +681,7 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
             f"CORRECTION from the user. {prior}\nThe user says: {correction}\n"
             f"This is ground truth. Fix whatever produced the error — stored memory, a tool, a specialist, "
             f"or your identity — so it stays fixed. Confirm what you changed.\n\n"
-            f"Your recent history, for context:\n{self._trace_digest(10)}")
+            f"Your recent history, for context:\n{self._session_review(10)}")
         self._record(f"[correction] {correction}", calls, output, True)
         return {"output": output, "calls": calls}
 
@@ -773,7 +693,8 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
         # matter how many months this agent has been running.
         with open(path, "w") as f:
             json.dump({"manifest": self.manifest, "skills": self.skills,
-                        "identity": self.identity, "team": self.team,
+                        "prompts": self.prompts,      # identity lives in here too
+                        "team": self.team,
                         "since_review": self.tasks_since_maintenance,
                         "corrections_since_review": self.corrections_since_review,
                         "traces": self.traces[-TRACES_IN_STATE:]}, f, indent=2)
@@ -783,7 +704,11 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
             data = json.load(f)
         self.manifest = {n: c for n, c in data.get("manifest", {}).items() if self._validate(c, n)}
         self.skills = data.get("skills", {})
-        self.identity = data.get("identity", self.identity)
+        # Saved prompts win; anything this build added that the state predates
+        # is filled in from the defaults, so upgrades are never lost.
+        self.prompts = {**DEFAULT_PROMPTS, **data.get("prompts", {})}
+        if "identity" in data:          # state written before identity moved in
+            self.prompts["identity"] = data["identity"]
         self.team = data.get("team", {})
         self.traces = data.get("traces", [])[-TRACES_IN_STATE:]
         # Without this the counter reset on every restart and the review
@@ -805,7 +730,7 @@ def _main():
     p.add_argument("--allow-spawn", action="store_true")
     p.add_argument("--workspace", default="agent_workspace")
     p.add_argument("--state", default="agent_state.json")
-    p.add_argument("--provider", default="anthropic", help="any arcllm provider")
+    p.add_argument("--provider", default="anthropic", help="anything llm.py supports")
     p.add_argument("--model", default=None, help="defaults to the provider's default_model")
     args = p.parse_args()
 
@@ -815,7 +740,7 @@ def _main():
     try:
         model = agent._client()      # fails fast on a missing key or bad provider
     except Exception as e:
-        sys.exit(f"arcllm could not load provider '{args.provider}': {e}")
+        sys.exit(f"could not load provider '{args.provider}': {e}")
     if os.path.exists(args.state):
         agent.load(args.state)
         print(f"[loaded: {len(agent.manifest)} tools, team of {len(agent.team)}, "
@@ -858,7 +783,7 @@ def _main():
             agent.save(args.state)
             continue
         if low == "history":
-            print(agent._trace_digest(40))
+            print(agent._session_review(40))
             continue
         if low == "cost":
             print(f"  ${agent.cost_usd:.4f} this session")
@@ -900,11 +825,11 @@ def _main():
             print(f"[call failed: {type(e).__name__}: {str(e)[:300]}]")
             if "not_found" in str(e) or "404" in str(e):
                 print(f"[the model '{model.model_name}' is unknown to this provider — "
-                      f"try --model <id>, or upgrade arcllm for current defaults]")
+                      f"try --model <id>]")
         agent.save(args.state)
 
     agent.save(args.state)
-    _sync(model.close())
+    model.close()
     print(f"\n[saved to {args.state} · ${agent.cost_usd:.4f} spent]")
 
 
