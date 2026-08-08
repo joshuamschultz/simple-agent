@@ -59,14 +59,12 @@ Ask next quarter and it just answers. That's the whole idea.
 
 ```mermaid
 flowchart LR
-    A["you ask<br/>in plain English"] --> B{"can it<br/>already?"}
+    A["you ask"] --> B{"can it already?"}
     B -->|yes| F["it answers"]
-    B -->|no| C["it builds<br/>the ability"]
-    C --> D["runs it<br/>safely"]
-    D --> F
-    F --> G["everything<br/>recorded"]
-    G --> H{"you correct it?<br/>time to review?"}
-    H -->|yes| I["it fixes the<br/>real cause"]
+    B -->|no| C["it builds the ability"]
+    C --> F
+    F --> H{"wrong, or time to review?"}
+    H -->|yes| I["it fixes the cause"]
     I --> B
     H -->|no| A
 
@@ -74,8 +72,8 @@ flowchart LR
     classDef make fill:#16233c,stroke:#63d19e,color:#e8eefc
     classDef learn fill:#1e1a3a,stroke:#7c5cff,color:#e8eefc
     class A,F ask
-    class C,D make
-    class G,H,I learn
+    class C make
+    class H,I learn
 ```
 
 ---
@@ -197,12 +195,11 @@ Here's a real thing it caught on its own:
 Nobody told it. It found that by reading its own history.
 
 ```mermaid
-flowchart TD
-    T["its own history<br/>what you asked · what it did · what it said"]
-    T --> Q{"did you get what<br/>you wanted?"}
+flowchart LR
+    T["its own history"] --> Q{"did you get what you wanted?"}
     Q --> R1["fix a tool"]
     Q --> R2["write a note"]
-    Q --> R3["change how it<br/>builds things"]
+    Q --> R3["change how it builds"]
     Q --> R4["repair saved data"]
 
     classDef t fill:#1a2740,stroke:#4f9cf9,color:#e8eefc
@@ -224,17 +221,12 @@ Those abilities then move *out* of the main assistant's head. So the more it
 learns, the more focused it stays.
 
 ```mermaid
-flowchart TD
-    R["main assistant<br/>stays light"]
-    M[("everything it has built")]
-    S1["a specialist<br/>own instructions<br/>own memory"]
-    S2["another specialist<br/>own instructions<br/>own memory"]
-
-    M --- R
-    M --- S1
-    M --- S2
-    R -.->|"hands off a task"| S1
-    R -.->|"hands off a task"| S2
+flowchart LR
+    M[("everything it has built")] --- R["main assistant"]
+    M --- S1["sales specialist"]
+    M --- S2["ops specialist"]
+    R -.->|"hands off"| S1
+    R -.->|"hands off"| S2
 
     classDef root fill:#1a2740,stroke:#4f9cf9,color:#e8eefc
     classDef reg fill:#0e1a30,stroke:#7c5cff,color:#e8eefc
