@@ -76,9 +76,13 @@ load_dotenv(os.path.join(_HERE, ".env"), override=True)
 from arcllm import (LLMResponse, Message, TextBlock, Tool, ToolResultBlock,  # noqa: E402
                     ToolUseBlock, load_model)
 
+MAX_TOKENS = 50000         # a cap, not a charge — only real output tokens bill
 MAX_TOOL_ITERS = 24
+CONTEXT_MESSAGES = 60      # running conversation kept in front of the model
 MAX_SPAWN_DEPTH = 2
-MAINTENANCE_EVERY = 25
+REVIEW_EVERY = 5                # review often; patterns hide in the gaps
+REVIEW_WINDOW = 50              # but always look back further than you review
+CORRECTIONS_BEFORE_REVIEW = 2   # or sooner, when the user has had to correct you
 SANDBOX_TIMEOUT = 30
 TRACES_IN_STATE = 200      # older traces live in the append-only log, not state
 
@@ -106,7 +110,7 @@ def _sync(coro):
 
 SEED_IDENTITY = """You are an agent that builds its own capabilities, memory, team, and even this system prompt as tasks require.
 
-Storage: grown code can call self._raw_read() / self._raw_write(content) on your one raw storage file — you decide the format. Build save/search/update interfaces on top as needed and improve them as you learn what works. Secrets: grown code reads credentials via self._secret("NAME"); never ask users to paste secret values into chat — they use the local !secret command.
+Storage: grown code can call self._raw_read() / self._raw_write(content) on your one raw storage file — you decide the format, and you are expected to keep changing it. The shape you pick on day one is the shape you understood least; when what you're storing outgrows it, migrate every record into a better one rather than bolting the new thing onto the old. Read a storage tool with read_tool before you change how anything is stored, and replace it under the same name. Secrets: grown code reads credentials via self._secret("NAME"); never ask users to paste secret values into chat — they use the local !secret command.
 
 You grow in TWO ways, and picking the right one matters:
 
@@ -145,11 +149,11 @@ print("__RESULT__" + json.dumps({{"result": str(_r)}}))
 
 
 class SelfBuildingAgent:
-    _META_ROOT = ("grow_tool", "grow_skill", "read_skill", "forget_skill",
+    _META_ROOT = ("grow_tool", "read_tool", "grow_skill", "read_skill", "forget_skill",
                    "update_identity", "create_specialist", "call_specialist",
                    "dissolve_specialist", "spawn_agent")
-    _META_CHILD = ("grow_tool", "grow_skill", "read_skill", "update_identity",
-                    "spawn_agent")
+    _META_CHILD = ("grow_tool", "read_tool", "grow_skill", "read_skill",
+                    "update_identity", "spawn_agent")
 
     def __init__(self, client=None, workspace: str = "agent_workspace",
                  allow_network: bool = False, allow_spawn: bool = False,
@@ -165,9 +169,11 @@ class SelfBuildingAgent:
         self.skills: dict[str, dict] = {}           # name -> {when, body, uses}
         self.team: dict[str, dict] = {}             # name -> {identity, tools, skills, description}
         self.traces: list[dict] = []
+        self.messages: list[Message] = []      # the live conversation
         self.allow_network = allow_network
         self.allow_spawn = allow_spawn
         self.tasks_since_maintenance = 0
+        self.corrections_since_review = 0
         self._spawn_depth = 0
         self._vault_path = os.path.join(workspace, ".secrets.json")
         if not os.path.exists(self._vault_path):
@@ -258,29 +264,66 @@ class SelfBuildingAgent:
         return self.client
 
     def _invoke(self, messages: list[Message], tools: list[Tool] | None = None) -> LLMResponse:
-        resp = _sync(self._client().invoke(messages, tools or None, max_tokens=2000))
+        resp = _sync(self._client().invoke(messages, tools or None, max_tokens=MAX_TOKENS))
         self.cost_usd += resp.cost_usd or 0.0
         return resp
 
     def _complete(self, system: str, messages: list[Message], tools: list[Tool]) -> LLMResponse:
         return self._invoke([Message(role="system", content=system), *messages], tools)
 
+    def _tool_contract(self, name: str, code: str) -> str:
+        """One line describing a tool the way a caller needs it: how to call
+        it and what it promises. Never its body."""
+        sig = code.split("\n", 1)[0].strip()
+        sig = sig[4:-1] if sig.startswith("def ") and sig.endswith(":") else name
+        doc = ""
+        m = __import__("re").search(r'"""(.*?)"""', code, __import__("re").S)
+        if m:
+            doc = " ".join(m.group(1).split())
+        return f"- self.{sig}\n    {doc or '(no description)'}"
+
     def _draft_method(self, gap_description: str) -> dict:
         import re as _re
-        existing = "\n".join(f"- {m}" for m in self.manifest) or "(none yet)"
+        # The interface, not the implementation. A drafter that sees source
+        # code and stored bytes copies whatever shape was invented first —
+        # which is the shape from when the least was known. Names, signatures
+        # and contracts are what a caller actually needs, and they leave the
+        # author free to build something better than what is already there.
+        existing = "\n".join(self._tool_contract(n, c) for n, c in self.manifest.items()) or "(none yet)"
         network = ("You may use urllib/sockets and any installed package to call APIs — network is enabled."
                    if self.allow_network else "No network calls.")
         prompt = f"""A capability gap: {gap_description}
 
-Existing tools (callable from your code via self.<name>(...)): 
+Tools that already exist. Call any of them from your code as self.<name>(...):
 {existing}
 
-Also always available to your code: self._raw_read(), self._raw_write(content),
-self._secret(name) for credentials. Full Python is available — any import,
-open() on workspace files. {network}
+If one of those already owns this job, the right move is usually to REPLACE it:
+draft under its exact name and yours supersedes it. Do that rather than adding a
+near-duplicate beside it.
+
+Storage: self._raw_read() and self._raw_write(content) share ONE store across
+every tool. So read it, change only the part your tool owns, and write the whole
+thing back — never blank another tool's data. Give what you own its own
+namespace, and put a type on records rather than leaving different kinds of
+thing jumbled together at the top level. If you are replacing a storage tool and
+the old shape was wrong, migrate it: read every existing record, move it into
+the better shape, write it back. Nothing already stored may be lost. The store
+is expected to keep improving; it should never be frozen at whatever the first
+tool happened to invent.
+
+Also available: self._secret(name) for credentials. Full Python — any import,
+open() on files. {network}
+
+Never assume a working directory. If your tool touches a path, take that path as
+a parameter so the caller supplies it.
+
+Make every action work on its own: a parameter only some actions need must have
+a default, never be required.
 
 Respond with ONLY a JSON object, no prose, no fences:
-{{"name": "<snake_case_name>", "code": "def <name>(self, <typed params>) -> <type>:\\n    \\"\\"\\"<one-line docstring — becomes the tool description>\\"\\"\\"\\n    <body>"}}
+{{"name": "<snake_case_name>", "code": "def <name>(self, <typed params>) -> <type>:\\n    \\"\\"\\"<one line: what it does, when to call it, and what it owns in the store>\\"\\"\\"\\n    <body>"}}
+The docstring is the ONLY thing other tools and future drafts will see about
+this tool, so make it a contract, not a label.
 First parameter must be self. Type-hint every parameter (str/int/float/bool/list/dict)."""
         resp = self._invoke([Message(role="user", content=prompt)])
         cleaned = _re.sub(r"^```(?:json)?|```$", "", (resp.content or "").strip(),
@@ -300,6 +343,15 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
             return f"Grew {spec['name']}. Callable from your next step."
         except Exception as e:
             return f"{FAILED}draft error: {e}"
+
+    def read_tool(self, name: str) -> str:
+        """Read a grown tool's source. Do this before changing how something
+        is stored or retrieved — grow_tool with the same name REPLACES it, so
+        repairing the tool you have beats growing a second one beside it."""
+        code = self.manifest.get(name)
+        if not code:
+            return f"{FAILED}no tool named '{name}'. You have: {list(self.manifest)}"
+        return code
 
     def grow_skill(self, name: str, when_to_use: str, body: str) -> str:
         """Write or rewrite a SKILL: durable instructions for yourself, in
@@ -485,13 +537,32 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
 
     # ---------------- the loop ----------------
 
-    def act(self, task: str):
-        messages: list[Message] = [Message(role="user", content=task)]
+    def act(self, task: str, fresh: bool = False):
+        """One task, inside the running conversation.
+
+        `fresh` isolates meta-work — a review, a draft — so it reasons about
+        the session without becoming part of it.
+        """
+        if fresh:
+            messages: list[Message] = [Message(role="user", content=task)]
+        else:
+            self.messages.append(Message(role="user", content=task))
+            messages = self.messages
         calls: list[dict] = []
         for _ in range(MAX_TOOL_ITERS):
             resp = self._complete(self._build_system(), messages, self._tools_schema())
             if resp.stop_reason != "tool_use":
-                return resp.content or "", calls
+                # A turn cut off at the token cap used to come back as an empty
+                # string and get filed as a success. Say so instead, and let
+                # run() record it as the failure it is.
+                if resp.stop_reason == "max_tokens" and not resp.content:
+                    answer = f"[no final answer — hit the {MAX_TOKENS} token cap mid-response]"
+                else:
+                    answer = resp.content or ""
+                if not fresh:
+                    messages.append(Message(role="assistant", content=answer or "(no answer)"))
+                    self._trim_conversation()
+                return answer, calls
             blocks = ([TextBlock(text=resp.content)] if resp.content else []) + [
                 ToolUseBlock(id=c.id, name=c.name, arguments=c.arguments) for c in resp.tool_calls]
             messages.append(Message(role="assistant", content=blocks))
@@ -512,22 +583,73 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
                               "args": call.arguments, "result": result[:200]})
                 tool_results.append(ToolResultBlock(tool_use_id=call.id, content=result))
             messages.append(Message(role="tool", content=tool_results))
+        if not fresh:
+            self._trim_conversation()
         return "[no final answer — exceeded tool-use iteration budget]", calls
+
+    def _trim_conversation(self) -> None:
+        """Bound the running conversation, cutting only at user turns.
+
+        Anthropic requires every tool_use block to be answered by a
+        tool_result, so a trim that lands mid-exchange produces an API error.
+        Dropping whole exchanges from the front is the only safe cut.
+        """
+        while len(self.messages) > CONTEXT_MESSAGES:
+            del self.messages[0]
+            while self.messages and self.messages[0].role != "user":
+                del self.messages[0]
 
     # ---------------- traces ----------------
 
     def _record(self, task: str, calls: list[dict], output: str, success: bool) -> dict:
         """Append one trace. The full history is an append-only log on disk;
         only the recent tail rides along in the state file."""
-        trace = {"task": task, "used": [c["tool"] for c in calls], "outcome": success,
-                 "correction": None, "calls": calls}
+        trace = {"task": task, "output": output[:600], "used": [c["tool"] for c in calls],
+                 "outcome": success, "correction": None, "calls": calls}
         self.traces.append(trace)
         try:
             with open(os.path.join(self.workspace, "traces.jsonl"), "a") as f:
-                f.write(json.dumps({**trace, "output": output[:400]}) + "\n")
+                f.write(json.dumps(trace) + "\n")
         except OSError:
             pass          # the log is for hindsight; never let it break a task
         return trace
+
+    def _session_review(self, limit: int = REVIEW_WINDOW) -> str:
+        """The recent session, verbatim, for review.
+
+        Counts and error rates describe whether the machinery ran. They say
+        nothing about whether the user got what they asked for — and that is
+        the only question worth reviewing. So this hands back the actual
+        exchange: what was asked, what was answered, what the tools returned.
+        A question asked twice, an answer the tool results don't support, two
+        tools returning the same list: all of it is visible in the transcript
+        and none of it is visible in a tally.
+        """
+        recent = [t for t in self.traces[-limit:] if t["task"] != "[maintenance]"]
+        if not recent:
+            return "(no session yet)"
+        out = []
+        for i, t in enumerate(recent, 1):
+            out.append(f"--- exchange {i} ---")
+            out.append(f"USER: {t['task'][:300]}")
+            for c in t.get("calls", []):
+                mark = "  [FAILED]" if not c["ok"] else ""
+                out.append(f"  tool {c['tool']}({json.dumps(c['args'])[:80]})"
+                            f" -> {c['result'][:130]}{mark}")
+            out.append(f"YOU: {(t.get('output') or '')[:250]}")
+            if t.get("correction"):
+                out.append(f"  ** THE USER THEN CORRECTED YOU: {t['correction']}")
+        usage: dict[str, int] = {}
+        for t in recent:
+            for c in t.get("calls", []):
+                usage[c["tool"]] = usage.get(c["tool"], 0) + 1
+        unused = [n for n in self.manifest if n not in usage]
+        if unused:
+            out.append(f"\nTools you never reached for: {', '.join(unused)}")
+        if self.skills:
+            out.append("Skills and how often you read them: " + ", ".join(
+                f"{n} {s.get('uses', 0)}x" for n, s in self.skills.items()))
+        return "\n".join(out)
 
     def _trace_digest(self, limit: int = 25) -> str:
         """Recent history, compressed, for the maintenance pass to read.
@@ -576,24 +698,52 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
             lines.extend(corrections[-5:])
         return "\n".join(lines)
 
+    def _act_review(self):
+        """The periodic review.
+
+        Deliberately short. A long instruction list produced an empty answer;
+        the same transcript with one blunt question produced the actual root
+        cause in a sentence. The transcript carries the evidence, so the
+        prompt only has to ask the right thing of it.
+        """
+        return self.act(
+            f"REVIEW — your last {REVIEW_WINDOW} exchanges, verbatim. What the user asked, what "
+            f"your tools returned, what you answered.\n\n{self._session_review()}\n\n"
+            "Read the whole run, not one exchange at a time. The problems worth fixing only show "
+            "up across exchanges: a question asked twice, a rephrase, a correction, an answer the "
+            "tool results never supported, two tools returning the same data, a lookup that misses "
+            "a name that is plainly there, judgment you worked out once and then worked out again.\n\n"
+            "One question: WHERE DID THE USER NOT GET WHAT THEY WANTED? A call can succeed and "
+            "still be wrong.\n\n"
+            "Then fix the cause so it cannot recur — read_tool and replace a broken tool under its "
+            "own name, migrate the store if its shape no longer fits, grow_skill so a judgment "
+            "survives, repair data a bad tool corrupted, promote or dissolve a specialist, "
+            "update_identity to match what actually exists.\n\n"
+            "Finish with 2-3 plain sentences to the user: what you got wrong, what is different now.",
+            fresh=True)
+
+    def review(self) -> dict:
+        """Run the review immediately instead of waiting for the cadence."""
+        self.tasks_since_maintenance = 0
+        self.corrections_since_review = 0
+        output, calls = self._act_review()
+        self._record("[maintenance]", calls, output, True)
+        return {"output": output, "calls": calls}
+
     def run(self, task: str, grader=None) -> dict:
         output, calls = self.act(task)
         success = grader(output) if grader else not output.startswith("[no final answer")
         self._record(task, calls, output, success)
         if self._spawn_depth == 0:
             self.tasks_since_maintenance += 1
-            if self.tasks_since_maintenance >= MAINTENANCE_EVERY:
+            # Cadence OR signal. Two corrections in a row means something is
+            # wrong now, and waiting another twenty tasks to look at it is how
+            # a small misunderstanding becomes a habit.
+            if (self.tasks_since_maintenance >= REVIEW_EVERY
+                    or self.corrections_since_review >= CORRECTIONS_BEFORE_REVIEW):
                 self.tasks_since_maintenance = 0
-                mout, mcalls = self.act(
-                    "MAINTENANCE: review your tool schema, team roster, identity, and the history below.\n\n"
-                    f"{self._trace_digest()}\n\n"
-                    "Merge redundant tools. Repair or replace whatever produced the failed calls. "
-                    "Sharpen your skills: rewrite any that were vague or wrong in practice, write a new "
-                    "one for judgment you have now repeated more than once, and forget any that no longer "
-                    "hold. If a family of tools and skills around one domain has reached critical mass, "
-                    "promote it with create_specialist. Dissolve specialists that have gone stale. Update "
-                    "your identity to reflect current reality — what you have built and where things live. "
-                    "Summarize what you changed in 2-3 sentences.")
+                self.corrections_since_review = 0
+                mout, mcalls = self._act_review()
                 self._record("[maintenance]", mcalls, mout, True)
         return {"output": output, "success": success, "used": [c["tool"] for c in calls],
                 "calls": calls}
@@ -606,6 +756,7 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
         if last:
             last["outcome"] = False
             last["correction"] = correction
+        self.corrections_since_review += 1
         output, calls = self.act(
             f"CORRECTION from the user. {prior}\nThe user says: {correction}\n"
             f"This is ground truth. Fix whatever produced the error — stored memory, a tool, a specialist, "
@@ -623,6 +774,8 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
         with open(path, "w") as f:
             json.dump({"manifest": self.manifest, "skills": self.skills,
                         "identity": self.identity, "team": self.team,
+                        "since_review": self.tasks_since_maintenance,
+                        "corrections_since_review": self.corrections_since_review,
                         "traces": self.traces[-TRACES_IN_STATE:]}, f, indent=2)
 
     def load(self, path: str):
@@ -633,6 +786,14 @@ First parameter must be self. Type-hint every parameter (str/int/float/bool/list
         self.identity = data.get("identity", self.identity)
         self.team = data.get("team", {})
         self.traces = data.get("traces", [])[-TRACES_IN_STATE:]
+        # Without this the counter reset on every restart and the review
+        # simply never fired.
+        # The conversation is deliberately NOT restored. A restart is a clean
+        # slate for the thread; what persists is what was learned — tools,
+        # skills, memory, identity.
+        self.messages = []
+        self.tasks_since_maintenance = data.get("since_review", 0)
+        self.corrections_since_review = data.get("corrections_since_review", 0)
 
 
 # ---------------- REPL ----------------
@@ -662,8 +823,8 @@ def _main():
     else:
         print("[cold start]")
     print(f"[{args.provider} · {model.model_name}]")
-    print("[!secret NAME | !secrets | !fb <text> | tools | skills | skill <name> | team | "
-          "identity | raw | history | cost | exit]\n")
+    print("[!secret NAME | !secrets | !fb <text> | review | new | tools | skills | skill <name> "
+          "| team | identity | raw | history | cost | exit]\n")
 
     while True:
         try:
@@ -685,6 +846,15 @@ def _main():
             continue
         if low.startswith("!fb "):
             print(agent.feedback(task[4:].strip())["output"])
+            agent.save(args.state)
+            continue
+        if low in ("new", "clear"):
+            agent.messages = []
+            agent.save(args.state)
+            print("  [conversation cleared — tools, skills and memory kept]")
+            continue
+        if low == "review":
+            print(agent.review()["output"])
             agent.save(args.state)
             continue
         if low == "history":
