@@ -51,6 +51,10 @@ dist/
 *.swp
 *~
 
+# --- diagram sources -------------------------------------------------------
+# mermaid sources + render config. Only the rendered assets/*.svg get pushed.
+diagrams/
+
 # --- scratch ---------------------------------------------------------------
 tmp/
 scratch/

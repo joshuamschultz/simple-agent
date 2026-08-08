@@ -136,6 +136,7 @@ class SelfBuildingAgent:
         self.team: dict[str, dict] = {}             # name -> {identity, tools, skills, description}
         self.traces: list[dict] = []
         self.messages: list[dict] = []         # the live conversation
+        self.on_event = None        # optional observer; the REPL uses it to narrate
         self.allow_network = allow_network
         self.allow_spawn = allow_spawn
         self.tasks_since_maintenance = 0
@@ -413,6 +414,7 @@ class SelfBuildingAgent:
                                     provider=self.provider, model=self.model)
         child._vault_path = self._vault_path  # one vault, harness-owned
         child._spawn_depth = self._spawn_depth + 1
+        child.on_event = self.on_event        # its work narrates under yours
         child.manifest = {t: self.manifest[t] for t in spec["tools"] if t in self.manifest}
         child.skills = {s: self.skills[s] for s in spec.get("skills", []) if s in self.skills}
         child.identity = spec["identity"]
@@ -452,6 +454,7 @@ class SelfBuildingAgent:
                                     provider=self.provider, model=self.model)
         child._vault_path = self._vault_path
         child._spawn_depth = self._spawn_depth + 1
+        child.on_event = self.on_event
         names = tools if tools else list(self.manifest.keys())
         child.manifest = {n: self.manifest[n] for n in names if n in self.manifest}
         child.skills = dict(self.skills)      # a one-off still gets the house knowledge
@@ -533,6 +536,28 @@ class SelfBuildingAgent:
             parts.append(f"Your team (route matching tasks with call_specialist):\n{roster}")
         return "\n\n".join(parts)
 
+    # ---------------- narration ----------------
+
+    def _emit(self, phase: str, tool: str, args: dict | None = None,
+              result: str = "", fresh: bool = False) -> None:
+        """Tell an observer what the agent is doing, as it does it.
+
+        Two phases per tool call — 'start' before it runs, 'end' after — so a
+        watcher can print a handoff line BEFORE the specialist's own activity
+        nests underneath it. 'answer' fires once, when a turn produces its
+        final reply. Narration is decoration: every failure here is swallowed,
+        because a broken display must never cost you a task.
+        """
+        if not self.on_event:
+            return
+        try:
+            self.on_event({"phase": phase, "tool": tool, "args": args or {},
+                           "result": result, "ok": not result.startswith(FAILED),
+                           "meta": tool in self._meta_names(),
+                           "depth": self._spawn_depth, "fresh": fresh})
+        except Exception:
+            pass
+
     # ---------------- the loop ----------------
 
     def act(self, task: str, fresh: bool = False):
@@ -556,6 +581,7 @@ class SelfBuildingAgent:
                     answer = f"[no final answer — hit the {MAX_TOKENS} token cap mid-response]"
                 else:
                     answer = reply["content"] or ""
+                self._emit("answer", "", result=answer, fresh=fresh)
                 if not fresh:
                     messages.append({"role": "assistant", "content": answer or "(no answer)"})
                     self._trim_conversation()
@@ -568,6 +594,7 @@ class SelfBuildingAgent:
             meta = set(self._meta_names())
             for call in reply["tool_calls"]:
                 name, args = call["name"], call["arguments"]
+                self._emit("start", name, args, fresh=fresh)
                 try:
                     if name in meta:
                         result = getattr(self, name)(**args)
@@ -578,6 +605,7 @@ class SelfBuildingAgent:
                 except Exception as e:
                     result = f"{FAILED}{type(e).__name__}: {e}"
                 result = str(result)
+                self._emit("end", name, args, result, fresh=fresh)
                 calls.append({"tool": name, "ok": not result.startswith(FAILED),
                               "args": args, "result": result[:200]})
                 tool_results.append({"type": "tool_result", "tool_use_id": call["id"],
@@ -730,6 +758,99 @@ class SelfBuildingAgent:
         self.corrections_since_review = data.get("corrections_since_review", 0)
 
 
+# ---------------- narration for the REPL ----------------
+
+# What each lever looks like when you watch it happen. The point is that
+# building a tool, writing a note and promoting a specialist are all visibly
+# ordinary moves — not hidden machinery.
+_ACTIVITY = {
+    "grow_tool":           ("✎", "built a tool"),
+    "read_tool":           ("↳", "read a tool"),
+    "grow_skill":          ("✎", "wrote a note"),
+    "read_skill":          ("↳", "read a note"),
+    "forget_skill":        ("✗", "dropped a note"),
+    "update_identity":     ("⟲", "rewrote itself"),
+    "read_prompt":         ("↳", "read a prompt"),
+    "update_prompt":       ("⟲", "rewrote a prompt"),
+    "create_specialist":   ("⚑", "new specialist"),
+    "call_specialist":     ("→", "handed off to"),
+    "dissolve_specialist": ("✗", "dissolved"),
+    "spawn_agent":         ("→", "sub-agent"),
+}
+# These two run a whole other agent. Announce them BEFORE they run, so that
+# agent's own activity reads as nested underneath.
+_HANDOFF = ("call_specialist", "spawn_agent")
+
+
+def _one_line(text, limit: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _columns(tool: str, args: dict, result: str) -> tuple[str, str]:
+    """(what it acted on, why) — the two right-hand columns of a line."""
+    name = _one_line(args.get("name") or "", 24)
+    if tool == "grow_tool":
+        m = _re.match(r"Grew (\w+)", result)          # the harness names it back
+        return (m.group(1) if m else "?"), _one_line(args.get("description"), 40)
+    if tool == "grow_skill":
+        return name, _one_line(args.get("when_to_use"), 40)
+    if tool == "create_specialist":
+        return name, _one_line(args.get("description"), 40)
+    if tool == "call_specialist":
+        return name, _one_line(args.get("task"), 40)
+    if tool == "spawn_agent":
+        return "one-off", _one_line(args.get("task"), 40)
+    if tool == "update_identity":
+        return f"{len(args.get('new_identity') or '')} chars", ""
+    return name, ""
+
+
+def _call_args(args: dict) -> str:
+    """A grown tool's call, the way you'd say it out loud."""
+    vals = [_one_line(v, 16) for v in args.values() if v not in (None, "", [], {})]
+    return ", ".join(vals)
+
+
+def _reporter():
+    """Print what the agent is doing, while it does it.
+
+    Returns a callback for SelfBuildingAgent.on_event. Specialists and
+    sub-agents share the same callback and report their own depth, so their
+    work indents under the handoff that started it.
+    """
+    was_fresh = [False]
+
+    def report(ev: dict) -> None:
+        pad = "  " + "  " * ev["depth"]
+        if ev["fresh"] and not was_fresh[0]:
+            print(f"{pad}·· reviewing its own work ··", flush=True)
+        was_fresh[0] = ev["fresh"]
+
+        if ev["phase"] == "answer":
+            print(f"{pad}✓ {'reviewed' if ev['fresh'] else 'answered'}", flush=True)
+            return
+
+        tool, handoff = ev["tool"], ev["tool"] in _HANDOFF
+        failed = ev["phase"] == "end" and not ev["ok"]
+        if not failed and (ev["phase"] == "start") != handoff:
+            return                                    # otherwise each call prints once
+
+        if failed:
+            mark, verb, subject = "✗", "failed", _one_line(tool, 24)
+            tail = _one_line(ev["result"][len(FAILED):], 40)
+        elif ev["meta"]:
+            mark, verb = _ACTIVITY.get(tool, ("·", tool))
+            subject, tail = _columns(tool, ev["args"], ev["result"])
+        else:                                         # a tool it grew, doing its job
+            mark, verb = "▸", "ran it"
+            subject = _one_line(f"{tool}({_call_args(ev['args'])})", 24)
+            tail = "→  " + _one_line(ev["result"], 40)
+        print(f"{pad}{mark} {verb:<17}{subject:<24}{tail}".rstrip(), flush=True)
+
+    return report
+
+
 # ---------------- REPL ----------------
 
 def _main():
@@ -741,11 +862,14 @@ def _main():
     p.add_argument("--state", default="agent_state.json")
     p.add_argument("--provider", default="anthropic", help="anything llm.py supports")
     p.add_argument("--model", default=None, help="defaults to the provider's default_model")
+    p.add_argument("--quiet", action="store_true", help="hide the live activity lines")
     args = p.parse_args()
 
     agent = SelfBuildingAgent(workspace=args.workspace,
                                 allow_network=args.allow_network, allow_spawn=args.allow_spawn,
                                 provider=args.provider, model=args.model)
+    if not args.quiet:
+        agent.on_event = _reporter()
     try:
         model = agent._client()      # fails fast on a missing key or bad provider
     except Exception as e:
@@ -828,7 +952,8 @@ def _main():
             print(agent._raw_read() or "(empty)")
             continue
         try:
-            print(agent.run(task)["output"])
+            answer = agent.run(task)["output"]
+            print(("\n" if agent.on_event else "") + answer)
         except Exception as e:
             # A provider error should cost you one turn, not the session.
             print(f"[call failed: {type(e).__name__}: {str(e)[:300]}]")

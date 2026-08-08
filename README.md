@@ -36,14 +36,17 @@ You ask something it has never been asked before:
 Instead of guessing, it builds what it needs:
 
 ```
-  ✎ built a tool     parse_ledger      reads a ledger file into monthly totals
-  ▸ ran it           ledger_q3.csv  →  jul 41,200 · aug 38,650 · sep 52,310
-  ✎ wrote a note     margin_review     how you like quarters summarized
+  ✎ built a tool     parse_ledger            reads a ledger into monthly totals
+  ▸ ran it           parse_ledger(q3.csv)    →  jul 41,200 · aug 38,650 · sep …
+  ✎ wrote a note     margin_review           when summarizing a quarter
   ✓ answered
 
 Q3 closed at $132,160, up 14% on Q2. September carried it — roughly
 half the quarter landed in the last five weeks.
 ```
+
+Those lines are real output, printed live as it works. You watch it build the
+thing, then use it.
 
 Two things now exist that didn't sixty seconds ago:
 
@@ -57,24 +60,9 @@ Ask next quarter and it just answers. That's the whole idea.
 
 ## The loop
 
-```mermaid
-flowchart LR
-    A["you ask"] --> B{"can it already?"}
-    B -->|yes| F["it answers"]
-    B -->|no| C["it builds the ability"]
-    C --> F
-    F --> H{"wrong, or time to review?"}
-    H -->|yes| I["it fixes the cause"]
-    I --> B
-    H -->|no| A
-
-    classDef ask fill:#1a2740,stroke:#4f9cf9,color:#e8eefc
-    classDef make fill:#16233c,stroke:#63d19e,color:#e8eefc
-    classDef learn fill:#1e1a3a,stroke:#7c5cff,color:#e8eefc
-    class A,F ask
-    class C make
-    class H,I learn
-```
+<p align="center">
+  <img src="assets/loop.svg" width="330" alt="You ask. If it can't already, it builds the ability. It answers. Then it checks whether that was wrong or due for review, and fixes the cause.">
+</p>
 
 ---
 
@@ -153,9 +141,9 @@ Say all three at once and it sorts them out itself:
   first, and never quote without a lead time. I also need percent-change math.
   And remember our main supplier is Acme.
 
-  ✎ note to itself   pricing_procedure     ← taste
-  ✎ built a tool     percent_change        ← exact math
-  ▸ saved a fact     supplier = Acme       ← something true
+  ✎ wrote a note     pricing_procedure       ← taste
+  ✎ built a tool     percent_change          ← exact math
+  ▸ ran it           save_fact(supplier,…)   ← something true
 ```
 
 **It stays fast as it grows.** Only a one-line summary of each ability sits in
@@ -194,21 +182,9 @@ Here's a real thing it caught on its own:
 
 Nobody told it. It found that by reading its own history.
 
-```mermaid
-flowchart LR
-    T["its own history"] --> Q{"did you get what you wanted?"}
-    Q --> R1["fix a tool"]
-    Q --> R2["write a note"]
-    Q --> R3["change how it builds"]
-    Q --> R4["repair saved data"]
-
-    classDef t fill:#1a2740,stroke:#4f9cf9,color:#e8eefc
-    classDef q fill:#1e1a3a,stroke:#7c5cff,color:#e8eefc
-    classDef r fill:#16233c,stroke:#63d19e,color:#e8eefc
-    class T t
-    class Q q
-    class R1,R2,R3,R4 r
-```
+<p align="center">
+  <img src="assets/review.svg" width="560" alt="It reads its own history and asks: did you get what you wanted? Then it fixes a tool, writes a note, changes how it builds, or repairs saved data.">
+</p>
 
 ---
 
@@ -220,25 +196,85 @@ Once one area of your work builds up enough abilities, it promotes them into a
 Those abilities then move *out* of the main assistant's head. So the more it
 learns, the more focused it stays.
 
-```mermaid
-flowchart LR
-    M[("everything it has built")] --- R["main assistant"]
-    M --- S1["sales specialist"]
-    M --- S2["ops specialist"]
-    R -.->|"hands off"| S1
-    R -.->|"hands off"| S2
+<p align="center">
+  <img src="assets/specialists.svg" width="600" alt="Everything it has built sits in one shared store. The main assistant hands matching work off to a specialist, which has its own instructions, its own tools and notes pared off the main assistant, and its own memory file kept between calls.">
+</p>
 
-    classDef root fill:#1a2740,stroke:#4f9cf9,color:#e8eefc
-    classDef reg fill:#0e1a30,stroke:#7c5cff,color:#e8eefc
-    classDef spec fill:#16233c,stroke:#3b567f,color:#e8eefc
-    class R root
-    class M reg
-    class S1,S2 spec
-```
+A new specialist gets **four things of its own**:
+
+| | |
+|---|---|
+| **Its own instructions** | A starting prompt written for that corner of the work, not the general one. It rewrites its own prompt as it learns. |
+| **Its own tools** | A named handful of what's been built so far, handed over to it. |
+| **Its own notes** | The skills that go with those tools, handed over too. |
+| **Its own memory file** | A folder on disk it keeps updating, call after call. This is the part that tunes over months. |
+
+The tools and notes it takes are **pared off the main assistant** — it stops
+carrying them, which is the whole point. There's still only one shared store
+underneath, so nothing gets duplicated or drifts out of sync. And anything the
+specialist builds while working goes straight back into that shared store, under
+its name.
 
 Specialists don't run in the background or cost anything when idle. They're just
 there when a matching task comes up, remembering everything they've learned about
 that corner of your work.
+
+---
+
+## What people point it at
+
+Same assistant, different jobs. Every line is paste-ready.
+
+**Email**
+```
+> draft my replies: decision first, short, no filler. save that as how you
+  always write email for me
+```
+
+**Morning briefing**
+```
+> each morning, give me one screen: what's open, what's late, what I said
+  I'd do. most urgent first
+```
+
+**Meeting notes**
+```
+> here are my notes. pull the decisions, who owns each one, and the dates.
+  keep a running list I can ask about later
+```
+
+**Customer and vendor notes**
+```
+> remember what I tell you about each customer and supplier, and show me
+  the history next time I mention one
+```
+
+**Planning**
+```
+> turn this project into weeks with dependencies, and tell me what slips
+  if one task moves
+```
+
+**Sales planning and coaching**
+```
+> track my pipeline by stage and value. every monday, tell me which deals
+  went quiet and what to say to each one
+```
+
+**SEO and AEO**
+```
+> read this page and tell me two things: what it's missing to rank, and
+  what it's missing to get quoted in an AI answer
+```
+
+**Bookkeeping and admin**
+```
+> categorize these expenses the way I did last month, and flag anything
+  that doesn't match a pattern you've seen
+```
+
+Nothing above is a feature that shipped with it. It builds each one the first
+time you ask, and keeps it.
 
 ---
 
@@ -260,8 +296,8 @@ Every line here is something you can type as-is.
 
 **Teach it your taste**
 ```
-> when I paste meeting notes, pull out the decisions and who owns each one.
-  decisions first, no filler.
+> when you write anything for me, lead with the answer, then the detail.
+  no preamble, no summary at the end.
 ```
 
 **Let it reach the web** (start with `python3 agent.py --allow-network`)
@@ -275,11 +311,28 @@ Every line here is something you can type as-is.
 > those note-taking abilities have piled up — turn them into a specialist
 ```
 
-Other directions people take it: sorting the inbox, categorizing expenses,
-tracking a sales pipeline, watching a home server, keeping a reading pile,
-studying for something and remembering what you keep getting wrong.
-
 The pattern never changes. **Say what you want. Let it build. Correct it once.**
+
+---
+
+## Watching it work
+
+It narrates itself while it works, so you can see it building and using its own
+machinery instead of guessing.
+
+| Line | What just happened |
+|---|---|
+| `✎ built a tool` | it wrote working code and kept it |
+| `✎ wrote a note` | it wrote a standing instruction to itself |
+| `▸ ran it` | it used something it built, and what came back |
+| `↳ read a note` | it loaded one of its notes *before* doing the work |
+| `⟲ rewrote itself` | it changed its own instructions |
+| `⚑ new specialist` | it promoted a group of abilities into an expert |
+| `→ handed off to` | a specialist took the task — its own lines indent underneath |
+| `✗ failed` | a call didn't work. It sees this too, and has to deal with it |
+| `·· reviewing its own work ··` | the periodic self-review, happening right now |
+
+Start with `python3 agent.py --quiet` if you'd rather just see answers.
 
 ---
 
@@ -314,9 +367,44 @@ llm.py       the seam — one method, plain dicts. Swap it for litellm, raw HTTP
 prompts.py   the words — seeded into state on first run, then the agent owns them
 ```
 
-**Everything learned lives in `agent_state.json`** — tools, notes, prompts,
-identity, specialists, recent history. Delete it to start over. Edit it by hand
-to retune the agent. There is no database and no migration.
+**One JSON file is the whole agent.** `agent_state.json` — tools, notes,
+prompts, identity, specialists, recent history. No database, no migration.
+
+```jsonc
+{
+  "manifest": { "manage_contacts": { "code": "def manage_contacts(self, action: str, ...", "description": "..." } },
+  "skills":   { "pricing_procedure": { "when": "when asked to price a job", "body": "...", "uses": 3 } },
+  "prompts":  { "identity": "...", "draft": "...", "review": "..." },
+  "team":     { "sales": { "identity": "...", "tools": [...], "skills": [...], "description": "..." } },
+  "traces":   [ ... ]
+}
+```
+
+**Everything is a string — including the code.** A grown tool is not a module
+and not a plugin. It is the *text* of a Python function, sitting in JSON, and it
+gets turned back into a callable on demand:
+
+- Every turn, `_tools_schema()` `exec`s each stored code string, reads the
+  resulting function with `inspect.signature`, and builds the tool schema from
+  that. Nothing is imported. Nothing is precompiled.
+- Every turn, `_build_system()` rebuilds the system prompt from
+  `prompts["identity"]`, plus a one-line index of every skill, plus the team
+  roster.
+- To actually run a tool, `_run_sandboxed()` joins every code string together,
+  drops the lot into a runner template, and `exec`s it in a subprocess where
+  each function is bound onto a shim object. That binding is why grown code can
+  call `self._raw_read()` and `self._secret("NAME")`.
+
+So there's no build step and no registration. The model writes a string; on the
+next turn the string is a tool.
+
+**You can edit the same file it edits.** Quit, open `agent_state.json`, change
+anything — reword its identity, fix a line inside a grown tool, delete a skill,
+retune the `draft` prompt that writes every future tool — then start it again.
+It reloads straight from that JSON and your change is live on the next message.
+It saves after every task, so edit between runs rather than during one. Delete
+the file to go back to stock; new keys added to `prompts.py` flow into an
+existing state on its next load.
 
 **Grown code runs in a subprocess** with a timeout and a scrubbed environment.
 
@@ -335,6 +423,93 @@ to retune the agent. There is no database and no migration.
 | `create_specialist` / `call_specialist` / `dissolve_specialist` | manage its team |
 | `spawn_agent` | one-off sub-agent, then gone |
 
+**The activity lines are a hook, not a `print`.** Set `agent.on_event = fn` and
+you get a dict per tool call — `{phase, tool, args, result, ok, meta, depth,
+fresh}` — twice per call (`start`, then `end`), plus once per turn when an
+answer lands. Specialists and sub-agents inherit the same callback and report
+their own `depth`, which is what makes their work indent. `_reporter()` in
+`agent.py` is just one consumer; swap in a logger, a UI, a metrics sink.
+Exceptions inside an observer are swallowed on purpose — a broken display must
+never cost you a task.
+
+**How memory actually gets made**
+
+Three kinds of memory, made three different ways.
+
+*A fact* — "our main supplier is Acme"
+
+1. The model looks for a tool that owns that kind of record. If there isn't one,
+   it calls `grow_tool` first, then saves.
+2. It calls that tool. The tool runs in a subprocess.
+3. Inside, `self._raw_read()` hands back the **entire** store as one JSON
+   string. The tool parses it, puts its record under its own top-level key, and
+   writes the whole document back with `self._raw_write(json.dumps(data))`.
+4. That write is atomic — temp file, then rename. A crash leaves the previous
+   contents intact.
+
+One file, `agent_workspace/memory.data`, shared by every tool it has ever
+written. Read the whole thing, change only your own key, write the whole thing
+back. That rule lives in the `draft` prompt, so every tool it writes is told it.
+
+*A note to itself* — "always confirm quantity and deadline"
+
+`grow_skill(name, when_to_use, body)` writes straight into `state["skills"]`.
+Only `name` and `when_to_use` ride in the system prompt; `read_skill` pulls the
+body in on the turn it's needed. That's why a large library stays cheap.
+
+*A tool*
+
+`grow_tool(description)` makes a **second** model call using the `draft` prompt.
+That call returns JSON — `{name, description, code}`. The harness `compile()`s
+the code to check it parses and confirms `def <name>(` is really in there. That
+is the whole check: valid, not correct. Then it lands in `state["manifest"]` and
+is callable on the next step. Growing under an existing name *replaces* it,
+which is how it repairs its own tools instead of piling up near-duplicates.
+
+*History*
+
+Every task appends one line to `agent_workspace/traces.jsonl` — what you asked,
+each tool call with its result, what it answered. The most recent 200 also ride
+in the state file. The review reads that transcript back and asks one question
+of it.
+
+*What deliberately doesn't persist:* the conversation. Restart and the thread is
+clean. The tools, skills, facts and identity are not.
+
+**What a specialist actually is**
+
+`create_specialist(name, identity, tools, description, skills)` writes one entry
+into `state["team"]` — a seed prompt, a list of tool names, a list of skill
+names, a one-line roster description — and makes the folder
+`agent_workspace/team/<name>/`. That's the whole registration. Nothing is
+copied, nothing runs.
+
+`call_specialist(name, task)` then assembles it on the spot:
+
+- a fresh `SelfBuildingAgent` pointed at that folder, so it gets its **own**
+  `memory.data` and its own `traces.jsonl`
+- `child.manifest` = only the named tools; `child.skills` = only the named
+  skills — subsets of the one central registry, not copies of it
+- `child.identity` = the seed prompt from its team entry
+- the root's connection pool and the single harness-owned secrets vault, shared
+
+It runs one task, then everything it grew merges back: new tools and skills join
+the central registry and get appended to its own lists, and if it rewrote its
+own prompt, that replaces the seed in `state["team"]`. Next call starts from the
+sharper version.
+
+Two things follow from the subsets. `_tools_schema()` and `_build_system()` skip
+anything a specialist owns, which is how the root's context *shrinks* as the
+team grows. And a specialist runs on a reduced lever set (`_META_CHILD`): it can
+grow tools, grow skills and rewrite its own identity, but it cannot create
+further specialists or touch the `draft` and `review` prompts.
+
+Its conversation starts empty on every call. Continuity comes from its memory
+file and its prompt — which is exactly why both are its own.
+
+`dissolve_specialist` drops the roster entry. The tools and skills return to the
+root's context; the folder and its memory stay on disk.
+
 **Configuration**
 
 | Flag | Default | Effect |
@@ -345,6 +520,7 @@ to retune the agent. There is no database and no migration.
 | `--state` | `agent_state.json` | everything it has learned |
 | `--allow-network` | off | grown code may make network calls |
 | `--allow-spawn` | off | enables one-off sub-agents |
+| `--quiet` | off | hide the live activity lines |
 
 Tuning constants sit at the top of `agent.py`: tool rounds per task, how often it
 reviews itself, how far back it looks.
