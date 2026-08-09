@@ -251,7 +251,33 @@ don't have something you do.
 
 ---
 
-## It can read things too big to read
+## It works past its own limits
+
+Every assistant has a window — a fixed amount it can hold in front of it at once.
+Three things run past that window, and each one has its own answer.
+
+### 1. It does the work in code, not in its head
+
+Ask about a thousand records and most assistants have to pull all thousand in
+front of themselves just to count them. Worse, everything they read stays in the
+way for the rest of the conversation.
+
+This one writes a few lines of code, runs them, and keeps only the answer:
+
+```
+> how many of my open orders are past due, and what's the total?
+
+  ⟩ ran code         rows = self.orders("l…  41 past due · $286,400
+  ✓ answered
+```
+
+The thousand records never entered the conversation. One line did.
+
+That code is scratch — it runs, it answers, it's gone. Nothing gets saved and
+nothing piles up. When it notices it has written the same block twice, that's its
+cue to turn it into a permanent tool instead.
+
+### 2. It can read things too big to read
 
 Ask it about something it saved months ago and a normal assistant is stuck: the
 file is bigger than what it can hold at once.
@@ -282,6 +308,95 @@ is your memory, a file, or everything it has ever built.
 
 If what comes back is still too big to make sense of, it says so and asks you to
 narrow the question. It does not quietly hand you half an answer.
+
+**The two cover for each other.** Code answers what counting settles; reading
+answers what takes judgment. When code prints more than it can look at, that
+output isn't dumped on you — it's saved whole to a file and handed back as a
+path, which is exactly what the readers take. Neither one dead-ends.
+
+### 3. A long conversation gets folded, not dropped
+
+Talk long enough and the earliest part of the conversation has to go. Throwing it
+away is the quiet failure: it keeps answering with no idea that what it needed was
+discarded twenty minutes ago, and you're the one who finds out.
+
+So before letting go, it writes that stretch down — every fact you stated, every
+decision, every correction, every number a tool came back with — and carries the
+note forward:
+
+```
+  ⇲ compacted        18 messages             deadline moved to the 14th; Acme…
+```
+
+The note sits with its instructions, where the next trim can't reach it. It goes
+away when you type `new` or restart, because by then the note *is* the
+conversation.
+
+---
+
+## Where everything lives
+
+Two things on disk hold the whole assistant. **`agent_state.json` is what it has
+become. `agent_workspace/` is where it works.**
+
+```
+simple-agent/
+├── agent.py            the whole assistant — one file, one class
+├── llm.py              the only part that knows about model providers
+├── prompts.py          its starting words, seeded into state on first run
+├── test_agent.py       26 tests. No model, no network, no cost
+├── setup.sh            the one-command install
+├── .env                your API key. Never leaves this machine
+│
+├── agent_state.json    EVERYTHING IT HAS LEARNED
+│                       its tools, its notes, its instructions, its specialists
+│
+└── agent_workspace/    EVERYTHING IT WORKS WITH
+    ├── memory.data     every fact it has saved, in one shared file
+    ├── traces.jsonl    every task it has ever done, appended forever
+    ├── .secrets.json   your keys and passwords, locked to your user account
+    ├── out_*.txt       output too long to read, parked for it to dig through
+    └── team/
+        └── sales/      one folder per specialist, made when it promotes one
+            ├── memory.data     that specialist's own memory, kept between calls
+            └── traces.jsonl    and its own history
+```
+
+All of it is plain files, right here in this folder. Nothing is running in the
+background and nothing is stored anywhere else. Delete `agent_state.json` and it
+goes back to knowing nothing; delete `agent_workspace/` and it forgets everything
+it was ever told.
+
+### Put your files in `agent_workspace/`
+
+That folder is its desk. Anything you drop there it can pick up by name — no
+upload, no path, no setting to change:
+
+```bash
+cp ~/Downloads/q3-sales.csv agent_workspace/
+```
+```
+> what's in q3-sales.csv?
+```
+
+Files anywhere else on your machine work too, you just have to give the whole
+path. Inside the workspace the name alone is enough, because that folder is where
+its code actually runs.
+
+It works in the other direction too. Ask for something written and, unless you
+name somewhere else, that's where it lands:
+
+```
+> turn those into a summary I can send, and save it as q3-summary.md
+```
+
+**Watch the folder as you work.** It fills up while you use it: the files you gave
+it, the files it wrote back, `memory.data` getting bigger every time it saves
+something, a new folder under `team/` the first time it promotes a specialist.
+Leave it open in Finder and you can watch what it's doing.
+
+Two things in there are its own bookkeeping and you never need to open them:
+`team/`, and `.secrets.json`, which holds your keys.
 
 ---
 
@@ -398,10 +513,15 @@ Every line here is something you can type as-is.
   up later even if I only remember part of the name
 ```
 
-**Point it at your files**
+**Point it at your files** (copy them into `agent_workspace/` first)
 ```
-> look at the spreadsheets in this folder and tell me what's in them
+> look at the spreadsheets in your workspace and tell me what's in them
 > now let me ask questions about any of them
+```
+
+**Make it work it out instead of reading it**
+```
+> count how many of these are still open, and total them by month
 ```
 
 **Teach it your taste**
@@ -435,6 +555,9 @@ machinery instead of guessing.
 | `✎ built a tool` | it wrote working code and kept it |
 | `✎ wrote a note` | it wrote a standing instruction to itself |
 | `▸ ran it` | it used something it built — the tool, what it was called with, what came back |
+| `⟩ ran code` | it worked something out in code rather than reading it all. The block it ran, and the answer it kept |
+| `⌕ read all of` | it read something too long to read, in parts, past every tool |
+| `⇲ compacted` | the conversation outgrew its window, so the oldest part was folded into a note it keeps |
 | `? asked` | it put a choice to you and waited — what you picked, and what it was about |
 | `↳ read a note` | it loaded one of its notes *before* doing the work |
 | `↳ read a tool` | it read a tool's own description back, usually before repairing it |
@@ -502,12 +625,13 @@ except `review`.
 
 <br>
 
-**Three files, three jobs.**
+**Three files, three jobs — and one that proves them.**
 
 ```
-agent.py     the harness — knows nothing about any model provider
-llm.py       the seam — one method, plain dicts. Swap it for litellm, raw HTTP, anything
-prompts.py   the words — seeded into state on first run, then the agent owns them
+agent.py       the harness — knows nothing about any model provider
+llm.py         the seam — one method, plain dicts. Swap it for litellm, raw HTTP, anything
+prompts.py     the words — seeded into state on first run, then the agent owns them
+test_agent.py  26 tests. Every one stubs the model or needs none: python3 test_agent.py
 ```
 
 **One JSON file is the whole agent.** `agent_state.json` — tools, notes,
@@ -517,7 +641,7 @@ prompts, identity, specialists, recent history. No database, no migration.
 {
   "manifest": { "manage_contacts": { "code": "def manage_contacts(self, action: str, ...", "description": "..." } },
   "skills":   { "pricing_procedure": { "when": "when asked to price a job", "body": "...", "uses": 3 } },
-  "prompts":  { "identity": "...", "draft": "...", "review": "..." },
+  "prompts":  { "identity": "...", "draft": "...", "review": "...", "compact": "...", "carried": "..." },
   "team":     { "sales": { "identity": "...", "tools": [...], "skills": [...], "description": "..." } },
   "traces":   [ ... ]
 }
@@ -549,7 +673,11 @@ It saves after every task, so edit between runs rather than during one. Delete
 the file to go back to stock; new keys added to `prompts.py` flow into an
 existing state on its next load.
 
-**Grown code runs in a subprocess** with a timeout and a scrubbed environment.
+**Grown code runs in a subprocess** with a timeout, a scrubbed environment, and
+the workspace as its working directory — which is why a relative filename in
+grown code, or in a block of `run_python`, resolves inside `agent_workspace/`.
+Secrets are passed in as `SECRET_<NAME>` env vars and scrubbed back out of
+anything the process returns.
 
 > That stops *accidents* — hangs, crashes, a tool wandering somewhere it
 > shouldn't. It does not stop malice: same user, same filesystem. Container-wrap
@@ -561,9 +689,10 @@ existing state on its next load.
 |---|---|
 | `grow_tool` / `read_tool` / `forget_tool` | write a tool, read one back to repair it, or drop one that shouldn't exist |
 | `grow_skill` / `read_skill` / `forget_skill` | write, load, or drop a standing instruction |
+| `run_python` | run a block in the same sandbox with every grown tool in scope. Nothing kept, only what it prints comes back |
 | `survey` | read something of any length — memory, a file, everything it has built — past every tool |
 | `update_identity` | rewrite its own system prompt |
-| `read_prompt` / `update_prompt` | rewrite how it drafts tools, or how it reviews itself |
+| `read_prompt` / `update_prompt` | rewrite how it drafts tools, reviews itself, or compacts a conversation |
 | `create_specialist` / `call_specialist` / `dissolve_specialist` | manage its team |
 | `spawn_agent` | one-off sub-agent, then gone |
 
@@ -588,6 +717,23 @@ one the root wrote, and throwing it away only means the next child writes it
 again. A child never clobbers a tool the root already has; it does hand back
 skills, which is how a specialist sharpens shared judgment.
 
+**Computing past the context window.** `run_python(code)` is not growth and
+registers nothing. It hands the block to the *same* `_sandbox` a grown tool goes
+through, with every stored tool defined and bound to `self` first — so a block
+reads exactly like a tool body: `self.<tool>(...)`, `self._raw_read()`,
+`self._secret(...)`, any import, `open()`. One process per run, nothing carried
+between them.
+
+Only stdout comes back. That's the whole economy: a tool call parks its entire
+result in the conversation for the rest of the session, where a block can read a
+hundred thousand records and hand back one number. Forty tool calls become one
+turn and one line.
+
+Print more than `CODE_OUTPUT_CHARS` (4,000) and the output does *not* land in the
+window. `_clip()` writes all of it to `agent_workspace/out_<id>.txt` and returns
+the head plus that path — the handoff to the other reading path below. Nothing is
+ever truncated silently.
+
 **Reading past the context window.** `survey(question, source)` resolves the
 source — `"memory"` for the raw store, `"state"` for everything grown, or a file
 path — splits it, and runs one reader agent per part. Each reader sees only its
@@ -600,6 +746,22 @@ records silently, and a quiet wrong answer is worse than a loud refusal.
 The chunk is 400,000 characters — about 100k tokens. On a million-token model
 that means splitting is the rare case, which is the point. One reader that sees
 everything beats five that each see a slice.
+
+**Compacting the conversation.** `_trim_conversation()` holds the thread to
+`CONTEXT_MESSAGES` (60) and never simply deletes what falls off the front.
+Whole exchanges leave together — cutting mid-exchange orphans a tool call — and
+what leaves goes through `_compact()`: one model call using the `compact` prompt,
+folding the dropped stretch *and* the previous note into one new note. That note
+rides in the system prompt under the `carried` prompt, where the next trim can't
+reach it.
+
+It must never cost a turn. Those messages are already out of the window by the
+time `_compact` runs, so a failed compaction leaves a visible hole in the note
+(`[N earlier messages … could not be summarized]`) instead of raising. Saying the
+hole is there beats pretending nothing was lost.
+
+The note dies on restart and on `new`, along with the conversation it summarizes.
+Tools, skills, facts and identity are not in it and do not care.
 
 **How memory actually gets made**
 
@@ -685,13 +847,15 @@ root's context; the folder and its memory stay on disk.
 |---|---|---|
 | `--provider` | `anthropic` | any provider `llm.py` supports |
 | `--model` | provider default | e.g. `claude-opus-4-6` |
-| `--workspace` | `agent_workspace` | memory, secrets, specialist dirs, trace log |
+| `--workspace` | `agent_workspace` | its desk: the files you give it, memory, secrets, specialist dirs, trace log |
 | `--state` | `agent_state.json` | everything it has learned |
 | `--allow-network` | off | grown code may make network calls |
 | `--allow-spawn` | off | enables one-off sub-agents |
 | `--quiet` | off | hide the live activity lines |
+| `--no-questions` | off | never stop to ask you anything — it decides and says what it assumed |
 
-Tuning constants sit at the top of `agent.py`: tool rounds per task, how often it
+Tuning constants sit at the top of `agent.py`: tool rounds per task, how many
+messages stay in the window, how much printed output may enter it, how often it
 reviews itself, how far back it looks.
 
 **Running for months.** Full history appends to `agent_workspace/traces.jsonl`;
@@ -712,6 +876,13 @@ An assistant that rewrites itself deserves an honest README.
   or when it reviews itself — one task later, not zero.
 - **It will occasionally say it saved something it didn't.** Type `history` when
   something feels off. That log is how you catch it.
+- **Giving it a file is a copy, not an upload.** There's no drop zone and no
+  folder that watches itself. Move the file into `agent_workspace/`, then say its
+  name. That's the whole flow today, and it's the part most likely to get nicer.
+- **A very long conversation is a summary of itself.** Past about sixty messages
+  the oldest part is a note, not the words. It keeps facts, decisions and
+  corrections on purpose, but a detail it judged unimportant is gone. Anything
+  that must survive belongs in a saved fact, not in the thread.
 - **It can rewrite its own instructions badly.** Self-review is the safeguard, not
   a guarantee.
 - **This is one agent on one machine.** No accounts, no sync, no multi-user. That
