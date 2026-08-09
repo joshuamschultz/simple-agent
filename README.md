@@ -82,12 +82,13 @@ python3 agent.py
 ```
 
 ```
-[cold start]
+[loaded: 0 tools, 0 skills, team of 0, identity 7084 chars]
 [anthropic · claude-sonnet-5]
 > _
 ```
 
-On later runs it tells you what it has become:
+Zero of everything, because it hasn't built anything yet. Every run it tells you
+what it has become:
 
 ```
 [loaded: 5 tools, 1 skill, team of 0, identity 4387 chars]
@@ -130,18 +131,21 @@ anything it says back to you. It never sees the values itself.
 
 ---
 
-## The three things it builds
+## The five things it builds
 
-Most assistants only have one of these. Having all three is what makes it
+Most assistants only have one of these. Having all five is what makes it
 compound.
 
-| | 🔧 **Tools** | 📘 **Notes to itself** | 🗂 **Facts** |
+| | **What it is** | **Good for** | **Example** |
 |---|---|---|---|
-| **What it is** | Working code | Standing instructions | What's true in your world |
-| **Good for** | Anything exact and repeatable | Judgment and taste | Names, numbers, decisions |
-| **Example** | reads your ledger file | *"lead with the total, always give a lead time"* | *"Acme sells us steel — fast but pricey"* |
+| 🔧 **Tools** | Working code | Anything exact and repeatable | reads your ledger file |
+| 📘 **Notes to itself** | Standing instructions | Judgment and taste | *"lead with the total, always give a lead time"* |
+| 🗂 **Facts** | What's true in your world | Names, numbers, decisions | *"Acme sells us steel — fast but pricey"* |
+| 📝 **Its own prompts** | The words it runs on | Fixing a pattern, not one bad answer | rewrites how it drafts every future tool |
+| 👥 **Specialists** | A second assistant, focused | One corner of the work that got big | a quoting expert with its own memory |
 
-Say all three at once and it sorts them out itself:
+The first three are the ones it sorts out on its own. Say all three in one
+breath and it files each one where it belongs:
 
 ```
 > When I ask you to price a job, always confirm the quantity and the deadline
@@ -152,6 +156,12 @@ Say all three at once and it sorts them out itself:
   ✎ built a tool     percent_change          ← exact math
   ▸ ran it           save_fact               supplier, Acme    ← something true
 ```
+
+The last two are how it works on itself. It can rewrite the very prompts that
+decide how it builds tools and how it reviews its own work — so a bad habit gets
+fixed once, at the source, instead of every time it shows up. And when one area
+of your work piles up enough abilities, it hands them to a
+[specialist](#it-brings-on-specialists) and stops carrying them itself.
 
 **It stays fast as it grows.** Only a one-line summary of each ability sits in
 front of it. The details load only when it actually reaches for one — so fifty
@@ -343,9 +353,7 @@ become. `agent_workspace/` is where it works.**
 simple-agent/
 ├── agent.py            the whole assistant — one file, one class
 ├── llm.py              the only part that knows about model providers
-├── prompts.py          its starting words, seeded into state on first run
-├── test_agent.py       26 tests. No model, no network, no cost
-├── setup.sh            the one-command install
+├── setup.sh            the one-command install — also writes its first words
 ├── .env                your API key. Never leaves this machine
 │
 ├── agent_state.json    EVERYTHING IT HAS LEARNED
@@ -625,17 +633,19 @@ except `review`.
 
 <br>
 
-**Three files, three jobs — and one that proves them.**
+**Two files, two jobs.**
 
 ```
-agent.py       the harness — knows nothing about any model provider
-llm.py         the seam — one method, plain dicts. Swap it for litellm, raw HTTP, anything
-prompts.py     the words — seeded into state on first run, then the agent owns them
-test_agent.py  26 tests. Every one stubs the model or needs none: python3 test_agent.py
+agent.py   the harness — knows nothing about any model provider
+llm.py     the seam — one method, plain dicts. Swap it for litellm, raw HTTP, anything
 ```
 
 **One JSON file is the whole agent.** `agent_state.json` — tools, notes,
 prompts, identity, specialists, recent history. No database, no migration.
+
+`setup.sh` writes it once, on install, and never touches it again. That is the
+only copy of its starting words that exists anywhere — the source code has none,
+so there is nothing to drift out of sync with.
 
 ```jsonc
 {
@@ -669,9 +679,9 @@ next turn the string is a tool.
 anything — reword its identity, fix a line inside a grown tool, delete a skill,
 retune the `draft` prompt that writes every future tool — then start it again.
 It reloads straight from that JSON and your change is live on the next message.
-It saves after every task, so edit between runs rather than during one. Delete
-the file to go back to stock; new keys added to `prompts.py` flow into an
-existing state on its next load.
+It saves after every task, so edit between runs rather than during one. To go
+back to stock, delete the file and run `./setup.sh` again — it writes a fresh
+one and leaves an existing one alone.
 
 **Grown code runs in a subprocess** with a timeout, a scrubbed environment, and
 the workspace as its working directory — which is why a relative filename in
@@ -887,10 +897,11 @@ An assistant that rewrites itself deserves an honest README.
   a guarantee.
 - **This is one agent on one machine.** No accounts, no sync, no multi-user. That
   simplicity is the point.
-- **Prompts are seeded once.** After first run they belong to the agent, in
-  `agent_state.json`. Upgrading the project adds any *new* prompt but will not
-  replace one it already has — delete that key from state if you want the new
-  version. `setup.sh` says so when it spots an existing state file.
+- **Its words are written once, at install.** `setup.sh` puts them in
+  `agent_state.json` and never touches that file again — so pulling a newer
+  version of the project will not change how your agent thinks. It has its own
+  copy and has probably edited it. Move the file aside and re-run `setup.sh` if
+  you want the new one; `setup.sh` says so when it finds an existing state file.
 
 ---
 
