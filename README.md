@@ -159,6 +159,51 @@ abilities cost about as much as five.
 
 ---
 
+## It asks before it builds the wrong thing
+
+Half of what you ask has two honest readings. An assistant that guesses spends a
+minute building the wrong one, and then you spend another minute explaining why.
+
+So when the choice is genuinely yours, **it stops and asks** — right there in the
+terminal, before it builds anything:
+
+```
+> I want to start tracking my invoices. Build what you need.
+
+  ┌ Invoice fields ─────────────────────────────────────────────────────
+  │ What do you need on each invoice? This decides the fields I build in.
+  │
+  │ ❯ Basics                  client, amount, issue date, due date, paid
+  │   Basics + line items     each invoice lists several items or services
+  │   Basics + currency       invoices in more than one currency
+  │   Something else          say it in your own words
+  └ ↑↓ move · 1-9 jump · enter choose · esc it decides
+```
+
+Arrow keys and enter, or just press the number. The menu disappears once you
+answer and leaves one line behind, so your screen keeps the decision and not the
+menu:
+
+```
+  ? asked            Basics                  Invoice fields
+  ✎ built a tool     invoices                add, list, mark paid, summarize
+  ✓ answered
+```
+
+**You are never boxed in.** *Something else* lets you type anything. `esc` hands
+the decision back — it picks, tells you what it assumed, and carries on.
+
+It's held to steering, not interviewing: **three questions per task, maximum**,
+and only for choices that change what gets built. Not for permission, and not for
+anything it could look up itself. If it asks something with one obvious answer,
+that's a mistake, and its own review is told to go looking for it.
+
+It never asks during its own self-review — nobody's watching that — and if it's
+running unattended (piped input, or `--no-questions`), the lever isn't in its
+hands at all: it decides, and says what it assumed.
+
+---
+
 ## It corrects itself
 
 Two ways, and neither one asks you to touch code.
@@ -390,6 +435,7 @@ machinery instead of guessing.
 | `✎ built a tool` | it wrote working code and kept it |
 | `✎ wrote a note` | it wrote a standing instruction to itself |
 | `▸ ran it` | it used something it built — the tool, what it was called with, what came back |
+| `? asked` | it put a choice to you and waited — what you picked, and what it was about |
 | `↳ read a note` | it loaded one of its notes *before* doing the work |
 | `↳ read a tool` | it read a tool's own description back, usually before repairing it |
 | `⟲ rewrote itself` | it changed its own instructions |
@@ -409,7 +455,8 @@ appears — so you can spot what it's touching without reading the verb.
 | 🟡 yellow | a **specialist** |
 | 🔴 red | something failed |
 
-Start with `python3 agent.py --quiet` if you'd rather just see answers. Colour
+Start with `python3 agent.py --quiet` if you'd rather just see answers, or
+`--no-questions` if you'd rather it never stopped to ask you anything. Colour
 turns itself off when the output isn't a terminal, or if you set `NO_COLOR=1`.
 
 ---

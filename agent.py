@@ -42,9 +42,11 @@ import inspect
 import json
 import os
 import re as _re
+import shutil
 import stat
 import subprocess
 import sys
+import textwrap
 import time
 import types
 import uuid
@@ -81,6 +83,8 @@ REVIEW_EVERY = 5                # review often; patterns hide in the gaps
 REVIEW_WINDOW = 50              # but always look back further than you review
 CORRECTIONS_BEFORE_REVIEW = 2   # or sooner, when the user has had to correct you
 SANDBOX_TIMEOUT = 30
+MAX_QUESTIONS_PER_TASK = 3  # steering, not an interview. Past this it decides
+                            # for itself and says what it assumed.
 TRACES_IN_STATE = 200      # older traces live in the append-only log, not state
 SURVEY_CHUNK = 400000      # characters handed to one reader ~= 100k tokens. Small
                            # enough for a 200k window, a rounding error in a 1M
@@ -94,6 +98,10 @@ FAILED = "FAILED: "
 
 _JSON_TYPE = {str: "string", int: "integer", float: "number", bool: "boolean",
               list: "array", dict: "object"}
+# `from __future__ import annotations` hands every annotation over as its NAME,
+# so a lever declared `tools: list` would be advertised as a string — and then
+# handed one. Both spellings mean the same JSON type.
+_JSON_TYPE.update({t.__name__: kind for t, kind in list(_JSON_TYPE.items())})
 
 _RUNNER = '''
 import json, os, sys
@@ -123,9 +131,10 @@ class SelfBuildingAgent:
     _META_ROOT = ("grow_tool", "read_tool", "grow_skill", "read_skill", "forget_skill",
                    "forget_tool", "update_identity", "read_prompt", "update_prompt",
                    "create_specialist",
-                   "call_specialist", "dissolve_specialist", "spawn_agent", "survey")
+                   "call_specialist", "dissolve_specialist", "spawn_agent", "survey",
+                   "ask_user")
     _META_CHILD = ("grow_tool", "read_tool", "grow_skill", "read_skill",
-                    "update_identity", "spawn_agent", "survey")
+                    "update_identity", "spawn_agent", "survey", "ask_user")
 
     def __init__(self, client=None, workspace: str = "agent_workspace",
                  allow_network: bool = False, allow_spawn: bool = False,
@@ -145,10 +154,19 @@ class SelfBuildingAgent:
         self.traces: list[dict] = []
         self.messages: list[dict] = []         # the live conversation
         self.on_event = None        # optional observer; the REPL uses it to narrate
+        self.ask_human = None       # optional questioner; set only when a person
+                                    # is at the terminal. None -> ask_user is not
+                                    # offered at all, and it decides for itself.
         self.allow_network = allow_network
         self.allow_spawn = allow_spawn
         self.tasks_since_maintenance = 0
         self.corrections_since_review = 0
+        # A one-element list because every child shares this exact object: the
+        # budget belongs to the TASK, not to whoever happens to be working on
+        # it. Three questions from the root and three more from a specialist it
+        # handed off to is six questions, and six is an interview.
+        self._asked = [0]
+        self._fresh_turn = False
         self._spawn_depth = 0
         self._vault_path = os.path.join(workspace, ".secrets.json")
         if not os.path.exists(self._vault_path):
@@ -290,6 +308,8 @@ class SelfBuildingAgent:
         child._vault_path = self._vault_path      # one vault, harness-owned
         child._spawn_depth = self._spawn_depth + 1
         child.on_event = self.on_event            # its work narrates under yours
+        child.ask_human = self.ask_human          # and it asks the same person,
+        child._asked = self._asked                # out of the same budget
         child.manifest = (dict(self.manifest) if tools is None else
                           {n: self.manifest[n] for n in tools if n in self.manifest})
         child.skills = (dict(self.skills) if skills is None else
@@ -609,12 +629,86 @@ class SelfBuildingAgent:
         output = self._run_child(child, task)
         return output + (f" [it also built, and you kept: {', '.join(grown)}]" if grown else "")
 
+    @staticmethod
+    def _options(options: list) -> list[tuple]:
+        """Options as (label, description). A plain string is a label with no
+        description; a dict may carry both. A whole list arriving as one JSON
+        string is unpacked — that is a normal thing for a model to send."""
+        if isinstance(options, str):
+            try:
+                options = json.loads(options)
+            except json.JSONDecodeError:
+                options = [options]
+        out = []
+        for opt in options or []:
+            if isinstance(opt, dict):
+                label = str(opt.get("label") or opt.get("option") or "").strip()
+                detail = str(opt.get("description") or opt.get("detail") or "").strip()
+            else:
+                label, detail = str(opt).strip(), ""
+            if label:
+                out.append((label, detail))
+        return out
+
+    def ask_user(self, question: str, options: list, header: str = "",
+                 allow_multiple: bool = False) -> str:
+        """Put a choice to the person and wait — they pick in their terminal and
+        their answer comes back to you as this tool's result.
+
+        Ask when the choice is genuinely theirs AND the answers lead to
+        different work: which of two readings of a vague request is meant, what
+        shape their data should take, how strict a rule should be, what to build
+        next. Ask BEFORE you build, not after — a question costs seconds, the
+        wrong build costs the whole turn.
+
+        Do not ask what you could look up, what has one sensible answer, or for
+        permission to do the thing you were just asked to do. Two or three per
+        task at most; past that, decide and say what you assumed.
+
+        options: 2-4 entries, each {"label": "the choice, a few words",
+        "description": "what it means or costs them"} — a plain string works
+        too. Put the one you recommend first. An escape hatch is added for you,
+        so never write one yourself. header: 2-4 words naming the decision.
+        allow_multiple: true only when picking several really is coherent."""
+        if self._fresh_turn:
+            return (f"{FAILED}nobody is watching a review. Decide this one yourself "
+                    f"and fix what needs fixing.")
+        if not self.ask_human:
+            return (f"{FAILED}nobody is at the terminal. Take the option you would "
+                    f"have recommended, say which you took and why, and carry on.")
+        choices = self._options(options)
+        if len(choices) < 2:
+            return (f"{FAILED}give at least two real options — a question with one "
+                    f"answer is a decision you have already made.")
+        if self._asked[0] >= MAX_QUESTIONS_PER_TASK:
+            return (f"{FAILED}{MAX_QUESTIONS_PER_TASK} questions have already been asked "
+                    f"on this task, which is the limit. Decide the rest yourself, state "
+                    f"the assumption you made, and let them correct you if it was wrong.")
+        self._asked[0] += 1
+        try:
+            answer = self.ask_human({"question": question, "options": choices,
+                                     "header": (header or "one decision").strip(),
+                                     "allow_multiple": bool(allow_multiple)})
+        except KeyboardInterrupt:
+            answer = ""
+        except Exception as e:
+            return f"{FAILED}could not ask: {type(e).__name__}: {e}"
+        if not answer:
+            return ("They skipped the question. Decide it yourself, say which way you "
+                    "went, and keep going — do not ask this again.")
+        return f"They chose: {answer}"
+
     # ---------------- schemas & system prompt ----------------
 
     def _meta_names(self):
+        """Which levers exist this turn. A lever with nothing behind it is not
+        offered at all — asking is only a tool while someone is there to answer,
+        and never during a review it gave itself."""
         names = self._META_ROOT if self._spawn_depth == 0 else self._META_CHILD
-        return [n for n in names if n != "spawn_agent" or
-                (self.allow_spawn and self._spawn_depth < MAX_SPAWN_DEPTH)]
+        return [n for n in names
+                if (n != "spawn_agent"
+                    or (self.allow_spawn and self._spawn_depth < MAX_SPAWN_DEPTH))
+                and (n != "ask_user" or (self.ask_human and not self._fresh_turn))]
 
     def _schema_for(self, name: str, fn, skip_self=False) -> dict:
         sig = inspect.signature(fn)
@@ -704,6 +798,10 @@ class SelfBuildingAgent:
         `fresh` isolates meta-work — a review, a draft — so it reasons about
         the session without becoming part of it.
         """
+        self._fresh_turn = fresh
+        if self._spawn_depth == 0:
+            self._asked[0] = 0      # a fresh budget per task, spent by whoever
+                                    # ends up doing the work
         if fresh:
             messages: list[dict] = [{"role": "user", "content": task}]
         else:
@@ -1023,6 +1121,8 @@ def _reporter():
 
         tool, handoff = ev["tool"], ev["tool"] in _HANDOFF
         failed = ev["phase"] == "end" and not ev["ok"]
+        if tool == "ask_user" and not failed:
+            return              # the question drew its own block, and its own answer
         if not failed and (ev["phase"] == "start") != handoff:
             return                                    # otherwise each call prints once
 
@@ -1046,6 +1146,148 @@ def _reporter():
     return report
 
 
+# ---------------- asking, at the terminal ----------------
+
+_ESCAPE_HATCH = ("Something else", "say it in your own words")
+
+
+def _read_key() -> str:
+    """One keypress, unbuffered. 'up' | 'down' | 'enter' | 'esc' | 'space' |
+    the character itself. Raises KeyboardInterrupt on ctrl-C, as usual.
+
+    Raw mode is entered and left around a single read, so a question never
+    leaves the terminal in a strange state if the turn dies mid-choice.
+    """
+    import select, termios, tty
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        # os.read, never sys.stdin.read — a buffered read swallows the rest of
+        # an arrow sequence into Python's own buffer, where select cannot see
+        # it, and every arrow then arrives as a bare ESC.
+        data = os.read(fd, 8)
+        if data == b"\x1b" and select.select([fd], [], [], 0.05)[0]:
+            data += os.read(fd, 7)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    if data in (b"\x1b[A", b"\x1bOA"):
+        return "up"
+    if data in (b"\x1b[B", b"\x1bOB"):
+        return "down"
+    if data == b"\x03":
+        raise KeyboardInterrupt
+    if not data or data[:1] == b"\x1b":
+        return "esc"                      # a bare ESC, or the terminal closed
+    ch = data.decode("utf-8", "ignore")[:1]
+    return {"\r": "enter", "\n": "enter", " ": "space"}.get(ch, ch)
+
+
+def _asker():
+    """Ask the person one multiple-choice question, in place, and return what
+    they said (empty string = they'd rather it decided).
+
+    Returns a callback for SelfBuildingAgent.ask_human. The block redraws over
+    itself while they move, then collapses to a single line once they've
+    chosen — so the scrollback keeps the decision and not the menu.
+    """
+    paint = _painter()
+
+    def draw(q, options, cursor, picked, multi, width) -> list[str]:
+        head = _one_line(q["header"], 40)
+        lines = [paint("  ┌ ", "dim") + paint(head, "team")
+                 + paint(" " + "─" * max(0, width - len(head) - 7), "dim")]
+        for line in textwrap.wrap(q["question"], max(20, width - 6)) or [""]:
+            lines.append(paint("  │ ", "dim") + line)
+        lines.append(paint("  │", "dim"))
+        labels = [(("[x] " if i in picked else "[ ] ") if multi else "") + label
+                  for i, (label, _) in enumerate(options)]
+        column = min(max(len(x) for x in labels) + 3, 46)
+        room = width - column - 9        # what is left for the descriptions
+        for i, ((_, detail), label) in enumerate(zip(options, labels)):
+            here = i == cursor
+            cell = label + " " * max(2, column - len(label))
+            # On a narrow terminal the choices themselves win the space. Half a
+            # description is worse than none — it reads as a different reason.
+            tail = _one_line(detail, room) if room >= 18 else ""
+            lines.append((paint("  │ ", "dim")
+                          + paint("❯ " if here else "  ", "ok")
+                          + (paint(cell, "team") if here else cell)
+                          + (paint(tail, "dim") if tail else "")).rstrip())
+        hint = ("↑↓ move · space pick · enter confirm · esc it decides" if multi
+                else "↑↓ move · 1-9 jump · enter choose · esc it decides")
+        lines.append(paint("  └ " + _one_line(hint, width - 4), "dim"))
+        return lines
+
+    def erase(height: int) -> None:
+        """Take the menu back off the screen. Once it is answered it is noise,
+        and a session full of spent menus is unreadable."""
+        sys.stdout.write(f"\033[{height}A" + "\033[2K\n" * height + f"\033[{height}A")
+        sys.stdout.flush()
+
+    def note(header: str, answer: str) -> None:
+        """What is left behind: one line, the same shape as everything else the
+        agent reports doing."""
+        print("  " + paint(f"? {'asked':<17}", "dim")
+              + _cell(_one_line(answer or "(left to it)", 22), 24, "team", paint)
+              + paint(_one_line(header, 44), "dim"), flush=True)
+
+    def choose(q, options, multi, width) -> str:
+        cursor, picked, height = 0, set(), 0
+        while True:
+            lines = draw(q, options, cursor, picked, multi, width)
+            sys.stdout.write(("\033[%dA" % height if height else "")
+                             + "".join("\033[2K" + ln + "\n" for ln in lines))
+            sys.stdout.flush()
+            height = len(lines)
+            try:
+                key = _read_key()
+            except KeyboardInterrupt:
+                key = "esc"     # the reflex for "stop asking me" is ctrl-C as
+                                # often as esc, and it must not cost the turn
+            if key in ("up", "down"):
+                cursor = (cursor + (1 if key == "down" else -1)) % len(options)
+            elif key.isdigit() and 1 <= int(key) <= len(options):
+                cursor = int(key) - 1
+                if not multi:
+                    key = "enter"
+            if key == "space" and multi:
+                picked.symmetric_difference_update({cursor})
+            elif key == "esc":
+                erase(height)
+                note(q["header"], "")
+                return ""
+            elif key == "enter":
+                chosen = sorted(picked) if multi and picked else [cursor]
+                erase(height)
+                if chosen == [len(options) - 1] and not multi:      # the escape hatch
+                    typed = input("  " + paint("in your own words: ", "dim")).strip()
+                    sys.stdout.write("\033[1A\033[2K")              # take the prompt back
+                    note(q["header"], typed)
+                    return typed
+                answer = ", ".join(options[i][0] for i in chosen)
+                note(q["header"], answer)
+                return answer
+
+    def ask(q: dict) -> str:
+        options = list(q["options"]) + ([] if q["allow_multiple"] else [_ESCAPE_HATCH])
+        width = min(shutil.get_terminal_size((88, 24)).columns - 2, 96)
+        try:
+            return choose(q, options, q["allow_multiple"], width)
+        except (ImportError, OSError, ValueError):
+            # No raw terminal here (Windows, an odd pty). Fall back to the
+            # plainest thing that works everywhere.
+            print(f"\n  {q['header']}: {q['question']}")
+            for i, (label, detail) in enumerate(options, 1):
+                print(f"    {i}. {label}" + (f"   — {detail}" if detail else ""))
+            typed = input("  number, your own answer, or blank to let it decide: ").strip()
+            if typed.isdigit() and 1 <= int(typed) <= len(options):
+                return "" if int(typed) == len(options) else options[int(typed) - 1][0]
+            return typed
+
+    return ask
+
+
 # ---------------- REPL ----------------
 
 def _main():
@@ -1058,6 +1300,8 @@ def _main():
     p.add_argument("--provider", default="anthropic", help="anything llm.py supports")
     p.add_argument("--model", default=None, help="defaults to the provider's default_model")
     p.add_argument("--quiet", action="store_true", help="hide the live activity lines")
+    p.add_argument("--no-questions", action="store_true",
+                   help="never stop to ask you anything — it decides everything itself")
     args = p.parse_args()
 
     agent = SelfBuildingAgent(workspace=args.workspace,
@@ -1065,6 +1309,10 @@ def _main():
                                 provider=args.provider, model=args.model)
     if not args.quiet:
         agent.on_event = _reporter()
+    # Only offer the question lever when there is a person on the other end of
+    # it. Piped in, or told not to, it is not in the schema at all.
+    if not args.no_questions and sys.stdin.isatty():
+        agent.ask_human = _asker()
     try:
         model = agent._client()      # fails fast on a missing key or bad provider
     except Exception as e:
