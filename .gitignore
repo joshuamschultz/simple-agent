@@ -16,6 +16,8 @@ workspace*/
 # manifest, identity, team, recent traces
 agent_state.json
 *state*.json
+# backups of any of the above are just as private
+*.bak
 # append-only history
 traces.jsonl
 **/traces.jsonl

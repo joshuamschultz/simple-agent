@@ -37,7 +37,7 @@ Instead of guessing, it builds what it needs:
 
 ```
   ✎ built a tool     parse_ledger            reads a ledger into monthly totals
-  ▸ ran it           parse_ledger(q3.csv)    →  jul 41,200 · aug 38,650 · sep …
+  ▸ ran it           parse_ledger            q3.csv        →  jul 41,200 · aug…
   ✎ wrote a note     margin_review           when summarizing a quarter
   ✓ answered
 
@@ -85,6 +85,13 @@ python3 agent.py
 [cold start]
 [anthropic · claude-sonnet-5]
 > _
+```
+
+On later runs it tells you what it has become:
+
+```
+[loaded: 5 tools, 1 skill, team of 0, identity 4387 chars]
+[anthropic · claude-sonnet-5]
 ```
 
 That's it. **Two dependencies.** No accounts to create, no services to configure,
@@ -143,7 +150,7 @@ Say all three at once and it sorts them out itself:
 
   ✎ wrote a note     pricing_procedure       ← taste
   ✎ built a tool     percent_change          ← exact math
-  ▸ ran it           save_fact(supplier,…)   ← something true
+  ▸ ran it           save_fact               supplier, Acme    ← something true
 ```
 
 **It stays fast as it grows.** Only a one-line summary of each ability sits in
@@ -182,9 +189,54 @@ Here's a real thing it caught on its own:
 
 Nobody told it. It found that by reading its own history.
 
+**It also checks itself, not just the conversation.** Reading the transcript only
+finds problems you can see. So it goes and looks at the whole store directly and
+asks a second set of questions: is anything saved somewhere no tool can reach any
+more? Does each tool still describe where its data actually lives? Are two tools
+keeping the same kind of thing in two places? Did something it replaced leave the
+old records stranded?
+
+That second pass matters because those failures are silent. A tool pointed at the
+wrong place doesn't error — it politely returns nothing, and you get told you
+don't have something you do.
+
 <p align="center">
   <img src="assets/review.svg" width="560" alt="It reads its own history and asks: did you get what you wanted? Then it fixes a tool, writes a note, changes how it builds, or repairs saved data.">
 </p>
+
+---
+
+## It can read things too big to read
+
+Ask it about something it saved months ago and a normal assistant is stuck: the
+file is bigger than what it can hold at once.
+
+This one splits the thing up and sends **a fresh reader at each part** — each one
+a full sub-agent with a clean head, seeing only its own chunk and your question.
+Then it combines what they found. Nothing huge ever lands in the conversation.
+
+```
+> check memory - who is jacob? he works with us
+  ▸ ran it           manage_contacts         list          →  {'contacts': {}}
+  ⌕ read all of      memory                  Who is Jacob? Any mention of a person…
+  ✓ answered
+
+Jacob is an **employee** (hire date 2026-08-08), assigned to the customer
+**US Siding** (a steel siding installer in Alabama).
+```
+
+That first line is a tool looking in the one place it knows about, and finding
+nothing. The second reads **everything you have**, in whatever shape it is
+currently in, past every tool.
+
+That difference matters more than it sounds. Tools each know one drawer. As the
+agent reorganizes over months, things move — and a record can end up in a drawer
+no tool opens any more. It's still there; nothing can see it. Reading everything
+directly is how it finds those again, and it's the same move whether the thing
+is your memory, a file, or everything it has ever built.
+
+If what comes back is still too big to make sense of, it says so and asks you to
+narrow the question. It does not quietly hand you half an answer.
 
 ---
 
@@ -215,9 +267,22 @@ underneath, so nothing gets duplicated or drifts out of sync. And anything the
 specialist builds while working goes straight back into that shared store, under
 its name.
 
+**How one actually gets better.** Every call, three things carry forward:
+
+- **Its memory grows.** Its own file on disk, added to on every call, never reset.
+- **Its instructions sharpen.** It can rewrite its own prompt, and the new version
+  is what starts the next call.
+- **Its abilities compound.** Anything it builds joins the shared store *and* its
+  own list, so it's better equipped next time.
+
 Specialists don't run in the background or cost anything when idle. They're just
 there when a matching task comes up, remembering everything they've learned about
 that corner of your work.
+
+One honest limit: a specialist doesn't re-read its own work the way the main
+assistant does. The main one reviews itself on a cadence; a specialist only
+improves through what it saves, writes and builds. If one starts drifting, you'll
+correct it the same way you correct anything else — by saying so.
 
 ---
 
@@ -324,33 +389,64 @@ machinery instead of guessing.
 |---|---|
 | `✎ built a tool` | it wrote working code and kept it |
 | `✎ wrote a note` | it wrote a standing instruction to itself |
-| `▸ ran it` | it used something it built, and what came back |
+| `▸ ran it` | it used something it built — the tool, what it was called with, what came back |
 | `↳ read a note` | it loaded one of its notes *before* doing the work |
+| `↳ read a tool` | it read a tool's own description back, usually before repairing it |
 | `⟲ rewrote itself` | it changed its own instructions |
 | `⚑ new specialist` | it promoted a group of abilities into an expert |
 | `→ handed off to` | a specialist took the task — its own lines indent underneath |
 | `✗ failed` | a call didn't work. It sees this too, and has to deal with it |
-| `·· reviewing its own work ··` | the periodic self-review, happening right now |
+| `┌── reviewing its own work` | the periodic self-review. Everything until `└── done reviewing` is a **separate task** it gave itself — your answer has already printed above it |
 
-Start with `python3 agent.py --quiet` if you'd rather just see answers.
+Names are colour-coded by kind, and a kind keeps its colour everywhere it
+appears — so you can spot what it's touching without reading the verb.
+
+| | |
+|---|---|
+| 🔵 cyan | a **tool** |
+| 🟢 green | a **note** to itself |
+| 🟣 magenta | a **prompt**, including its own identity |
+| 🟡 yellow | a **specialist** |
+| 🔴 red | something failed |
+
+Start with `python3 agent.py --quiet` if you'd rather just see answers. Colour
+turns itself off when the output isn't a terminal, or if you set `NO_COLOR=1`.
 
 ---
 
 ## While you're at the prompt
 
-| Type this | To see |
+Everything below is typed at the `>` prompt. Nothing here costs a model call
+except `review`.
+
+**See what it has become**
+
+| Type this | What you get |
 |---|---|
-| `tools` / `skills` | what it has built so far |
-| `skill <name>` | one of its notes, in full |
-| `team` | its specialists |
-| `identity` | its current instructions |
-| `history` | this session, the way it reviews it |
-| `review` | make it review itself right now |
-| `raw` | everything it has remembered |
-| `cost` | what you've spent this session |
-| `!fb <text>` | correct it — this is the important one |
-| `!secret NAME` | store a password or key, typed privately |
-| `new` | start a fresh conversation, keep everything it learned |
+| `tools` | every tool it has built, and which specialist owns each |
+| `skills` | every note to itself, when it uses each, how often it has read it |
+| `skill <name>` | one of those notes, in full |
+| `team` | its specialists and what each is for |
+| `identity` | its current instructions, exactly as the model sees them |
+| `raw` | everything it has remembered, straight from the store |
+| `history` | this session the way it reviews it — calls, results, answers |
+| `cost` | what you have spent since you started |
+
+**Change it**
+
+| Type this | What happens |
+|---|---|
+| `!fb <text>` | tell it it was wrong. **This is the important one** — it treats your words as final and has to go fix whatever caused it |
+| `review` | make it re-read its own work now instead of waiting for the cadence |
+| `!secret NAME` | store a password or key. You type the value privately; it never sees the value, only the name |
+| `!secrets` | list which secrets are stored, names only |
+
+**Session**
+
+| Type this | What happens |
+|---|---|
+| `new` (or `clear`) | start a fresh conversation, keep everything it has learned |
+| `exit` (or `quit`) | save and leave |
 
 ---
 
@@ -416,8 +512,9 @@ existing state on its next load.
 
 | Lever | What it does |
 |---|---|
-| `grow_tool` / `read_tool` | write a new tool, or read one back to repair it |
+| `grow_tool` / `read_tool` / `forget_tool` | write a tool, read one back to repair it, or drop one that shouldn't exist |
 | `grow_skill` / `read_skill` / `forget_skill` | write, load, or drop a standing instruction |
+| `survey` | read something of any length — memory, a file, everything it has built — past every tool |
 | `update_identity` | rewrite its own system prompt |
 | `read_prompt` / `update_prompt` | rewrite how it drafts tools, or how it reviews itself |
 | `create_specialist` / `call_specialist` / `dissolve_specialist` | manage its team |
@@ -431,6 +528,31 @@ their own `depth`, which is what makes their work indent. `_reporter()` in
 `agent.py` is just one consumer; swap in a logger, a UI, a metrics sink.
 Exceptions inside an observer are swallowed on purpose — a broken display must
 never cost you a task.
+
+**One way a child agent is born.** A specialist, a one-off sub-agent, and a
+`survey` reader are the same machinery: `_child()` builds it with the shared
+connection pool, the one harness-owned secrets vault, the same narration
+callback, and one more level of depth. Only three things ever differ — who it
+is, where it works, and which subset of the registry it can see.
+
+`_absorb()` then takes back everything it produced. Not just what it spent —
+what it **built**. A tool a reader had to write to finish its part is as real as
+one the root wrote, and throwing it away only means the next child writes it
+again. A child never clobbers a tool the root already has; it does hand back
+skills, which is how a specialist sharpens shared judgment.
+
+**Reading past the context window.** `survey(question, source)` resolves the
+source — `"memory"` for the raw store, `"state"` for everything grown, or a file
+path — splits it, and runs one reader agent per part. Each reader sees only its
+part and the question. Their findings come back and are merged in one more pass.
+
+If those findings are themselves larger than one window, it returns `FAILED` and
+asks for a narrower question. It does *not* fold them again: folding drops
+records silently, and a quiet wrong answer is worse than a loud refusal.
+
+The chunk is 400,000 characters — about 100k tokens. On a million-token model
+that means splitting is the rare case, which is the point. One reader that sees
+everything beats five that each see a slice.
 
 **How memory actually gets made**
 
@@ -493,10 +615,10 @@ copied, nothing runs.
 - `child.identity` = the seed prompt from its team entry
 - the root's connection pool and the single harness-owned secrets vault, shared
 
-It runs one task, then everything it grew merges back: new tools and skills join
-the central registry and get appended to its own lists, and if it rewrote its
-own prompt, that replaces the seed in `state["team"]`. Next call starts from the
-sharper version.
+It runs one task, then `_absorb` puts everything it grew into the central
+registry, and its roster entry is updated to what the child ended up with —
+including its own prompt if it rewrote one. Next call starts from the sharper
+version.
 
 Two things follow from the subsets. `_tools_schema()` and `_build_system()` skip
 anything a specialist owns, which is how the root's context *shrinks* as the
@@ -547,6 +669,10 @@ An assistant that rewrites itself deserves an honest README.
   a guarantee.
 - **This is one agent on one machine.** No accounts, no sync, no multi-user. That
   simplicity is the point.
+- **Prompts are seeded once.** After first run they belong to the agent, in
+  `agent_state.json`. Upgrading the project adds any *new* prompt but will not
+  replace one it already has — delete that key from state if you want the new
+  version. `setup.sh` says so when it spots an existing state file.
 
 ---
 

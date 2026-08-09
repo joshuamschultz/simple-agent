@@ -45,6 +45,7 @@ import re as _re
 import stat
 import subprocess
 import sys
+import time
 import types
 import uuid
 
@@ -81,6 +82,10 @@ REVIEW_WINDOW = 50              # but always look back further than you review
 CORRECTIONS_BEFORE_REVIEW = 2   # or sooner, when the user has had to correct you
 SANDBOX_TIMEOUT = 30
 TRACES_IN_STATE = 200      # older traces live in the append-only log, not state
+SURVEY_CHUNK = 400000      # characters handed to one reader ~= 100k tokens. Small
+                           # enough for a 200k window, a rounding error in a 1M
+                           # one. Sized so that splitting is the rare case: one
+                           # reader that sees everything beats five that don't.
 
 # Every harness-owned failure string starts with this. A tool result either
 # begins with FAILED: or it worked — that is the whole outcome contract, and
@@ -116,10 +121,11 @@ print("__RESULT__" + json.dumps({{"result": str(_r)}}))
 
 class SelfBuildingAgent:
     _META_ROOT = ("grow_tool", "read_tool", "grow_skill", "read_skill", "forget_skill",
-                   "update_identity", "read_prompt", "update_prompt", "create_specialist",
-                   "call_specialist", "dissolve_specialist", "spawn_agent")
+                   "forget_tool", "update_identity", "read_prompt", "update_prompt",
+                   "create_specialist",
+                   "call_specialist", "dissolve_specialist", "spawn_agent", "survey")
     _META_CHILD = ("grow_tool", "read_tool", "grow_skill", "read_skill",
-                    "update_identity", "spawn_agent")
+                    "update_identity", "spawn_agent", "survey")
 
     def __init__(self, client=None, workspace: str = "agent_workspace",
                  allow_network: bool = False, allow_spawn: bool = False,
@@ -128,6 +134,8 @@ class SelfBuildingAgent:
         self.provider = provider
         self.model = model            # None -> provider's default_model
         self.cost_usd = 0.0
+        self.model_calls = 0          # how many round trips, and how long they took —
+        self.model_seconds = 0.0      # the only honest way to locate a slow turn
         self.workspace = workspace
         os.makedirs(workspace, exist_ok=True)
         self.prompts: dict[str, str] = dict(DEFAULT_PROMPTS)
@@ -238,6 +246,57 @@ class SelfBuildingAgent:
 
     # ---------------- the model ----------------
 
+    def _absorb(self, child: "SelfBuildingAgent") -> None:
+        """Take back everything a finished child produced.
+
+        Not just what it spent — what it BUILT. A tool a reader had to write
+        to get through its part is as real as one you wrote yourself, and
+        discarding it only means the next child writes it again. Every path
+        that runs a child goes through here, so growth is kept the same way
+        whoever did the growing.
+
+        A child never clobbers a tool you already have (its copy may be a
+        stale fork of yours); it does hand back skills, which is how a
+        specialist sharpens shared judgment.
+        """
+        self.cost_usd += child.cost_usd
+        self.model_calls += child.model_calls
+        self.model_seconds += child.model_seconds
+        for name, entry in child.manifest.items():
+            self.manifest.setdefault(name, entry)
+        self.skills.update(child.skills)
+
+    def _run_child(self, child: "SelfBuildingAgent", task: str) -> str:
+        """Run a child to completion and take back everything it produced."""
+        result = child.run(task)
+        self._absorb(child)
+        return result["output"]
+
+    def _child(self, identity: str, workspace: str | None = None,
+               tools: list | None = None, skills: list | None = None) -> "SelfBuildingAgent":
+        """The one way a child agent is born, used by every path that makes
+        one — a specialist, a one-off spawn, a survey reader.
+
+        Same connection pool, same harness-owned vault, same narration, one
+        level deeper. Only three things ever differ: who it is, where it
+        works, and which subset of the registry it can see. None is a subset
+        meaning "all of it".
+        """
+        child = SelfBuildingAgent(client=self._client(),
+                                  workspace=workspace or self.workspace,
+                                  allow_network=self.allow_network,
+                                  allow_spawn=self.allow_spawn,
+                                  provider=self.provider, model=self.model)
+        child._vault_path = self._vault_path      # one vault, harness-owned
+        child._spawn_depth = self._spawn_depth + 1
+        child.on_event = self.on_event            # its work narrates under yours
+        child.manifest = (dict(self.manifest) if tools is None else
+                          {n: self.manifest[n] for n in tools if n in self.manifest})
+        child.skills = (dict(self.skills) if skills is None else
+                        {n: self.skills[n] for n in skills if n in self.skills})
+        child.identity = identity
+        return child
+
     def _client(self):
         """Long-lived — one connection pool, shared with every specialist
         and sub-agent this agent creates."""
@@ -246,7 +305,14 @@ class SelfBuildingAgent:
         return self.client
 
     def _complete(self, system: str, messages: list[dict], tools: list[dict] | None = None) -> dict:
-        reply = self._client().complete(system, messages, tools, max_tokens=MAX_TOKENS)
+        started = time.perf_counter()
+        try:
+            reply = self._client().complete(system, messages, tools, max_tokens=MAX_TOKENS)
+        finally:
+            # Count the wait even when the call raises — a slow failure is
+            # still where the time went.
+            self.model_seconds += time.perf_counter() - started
+            self.model_calls += 1
         self.cost_usd += reply["cost_usd"] or 0.0
         return reply
 
@@ -328,6 +394,74 @@ class SelfBuildingAgent:
         verb = "Rewrote" if existing else "Wrote"
         return f"{verb} skill '{name}' ({len(body)} chars). It is in your index; read_skill loads it."
 
+    def survey(self, question: str, source: str = "memory") -> str:
+        """Answer one question about something FAR too long to read at once.
+        Hands each part of the source to its own reader — a fresh agent with a
+        clean window that sees nothing but that part and your question — then
+        combines what they found. Nothing large ever enters your own context.
+        source is "memory" for the entire raw store, "state" for everything you
+        have built, or a file path. A tool shows you only its own namespace;
+        this shows you all of it, including records left under keys no current
+        tool owns."""
+        try:
+            text = self._source_text(source)
+        except OSError as e:
+            return f"{FAILED}cannot read '{source}': {e}"
+        if not text.strip():
+            return f"'{source}' is empty."
+
+        parts = [text[i:i + SURVEY_CHUNK] for i in range(0, len(text), SURVEY_CHUNK)]
+        found = []
+        for i, part in enumerate(parts, 1):
+            said = self._read_part(
+                self.prompts["survey"].format(part=i, parts=len(parts), question=question),
+                part)
+            if said and said.lower().rstrip(".") != "nothing here":
+                found.append(said)
+        if not found:
+            return (f"Read all {len(text):,} characters of {source}, in "
+                    f"{len(parts)} part(s). Nothing in it answers that.")
+        if len(parts) == 1:
+            return found[0]
+
+        merged = "\n\n".join(found)
+        # Combining is one more read, so it obeys the same limit. Folding the
+        # findings again would silently drop records, and a quiet wrong answer
+        # is worse than a loud refusal — say so and let the caller narrow it.
+        if len(merged) > SURVEY_CHUNK:
+            return (f"{FAILED}{len(parts)} readers came back with {len(merged):,} "
+                    f"characters of findings, more than one reader can hold. Ask "
+                    f"something narrower, or survey a smaller source.")
+        reply = self._complete(
+            self.prompts["merge"].format(question=question, part=1, parts=1),
+            [{"role": "user", "content": merged}])
+        return (reply["content"] or merged).strip()
+
+    def _read_part(self, identity: str, part: str) -> str:
+        """One reader, one part, its own window.
+
+        A real child agent while there is spawn depth left, so a reader can
+        call a tool or open a file the part points at rather than only
+        describing it. Past that depth it degrades to a plain model call,
+        which is what bounds the recursion.
+        """
+        if self._spawn_depth >= MAX_SPAWN_DEPTH:
+            reply = self._complete(identity, [{"role": "user", "content": part}])
+            return (reply["content"] or "").strip()
+        reader = self._child(identity)   # same world, its own window
+        return (self._run_child(reader, part) or "").strip()
+
+    def _source_text(self, source: str) -> str:
+        """The three places a long string lives here: the shared store, the
+        record of everything grown, or a file on disk."""
+        if source == "memory":
+            return self._raw_read()
+        if source == "state":
+            return json.dumps({"manifest": self.manifest, "skills": self.skills,
+                               "prompts": self.prompts, "team": self.team}, indent=2)
+        with open(source) as f:
+            return f.read()
+
     def read_skill(self, name: str) -> str:
         """Load one skill's full text into this turn. Read a skill BEFORE
         doing the work it covers, not after."""
@@ -337,13 +471,38 @@ class SelfBuildingAgent:
         skill["uses"] = skill.get("uses", 0) + 1
         return f"SKILL {name} — {skill['when']}\n\n{skill['body']}"
 
+    def forget_tool(self, name: str) -> str:
+        """Delete a tool that should not exist — a one-off you kept, or one
+        superseded by something better under a different name. Prefer
+        REPLACING it: grow_tool under the same name supersedes it and leaves
+        every caller working. Delete only when nothing should own this job.
+
+        If it owned records in the store, MOVE THEM FIRST. Deleting the only
+        tool that reads a key does not delete the records — it makes them
+        unreachable, which is worse than either keeping the tool or dropping
+        the data."""
+        if name not in self.manifest:
+            return f"{FAILED}no tool named '{name}'. You have: {list(self.manifest)}"
+        del self.manifest[name]
+        freed = self._unassign("tools", name)
+        return (f"Forgot tool '{name}'.{freed} If it owned anything in the store, "
+                f"survey memory now and move those records somewhere a tool can reach.")
+
     def forget_skill(self, name: str) -> str:
         """Delete a skill that is wrong, stale, or superseded. Prefer
         rewriting with grow_skill; delete only when it should not exist."""
         if name not in self.skills:
             return f"{FAILED}no skill named '{name}'."
         del self.skills[name]
-        return f"Forgot skill '{name}'."
+        return f"Forgot skill '{name}'.{self._unassign('skills', name)}"
+
+    def _unassign(self, field: str, name: str) -> str:
+        """Drop a deleted name from every specialist that listed it, so no
+        roster points at something that is no longer there."""
+        owners = [sn for sn, spec in self.team.items() if name in spec.get(field, ())]
+        for sn in owners:
+            self.team[sn][field] = [x for x in self.team[sn][field] if x != name]
+        return f" Also removed from {', '.join(owners)}." if owners else ""
 
     @property
     def identity(self) -> str:
@@ -403,34 +562,24 @@ class SelfBuildingAgent:
                 f"Route matching tasks to it with call_specialist.")
 
     def call_specialist(self, name: str, task: str) -> str:
-        """Run one task on a registered specialist. It gets its identity, its
-        tool subset, and its own persistent memory. Anything it grows joins
-        the central registry under its ownership."""
+        """Run one task on a registered specialist. Same machinery as a one-off
+        sub-agent, with its saved state injected: its own identity, its own
+        tool and skill subset, its own memory that has been accumulating since
+        the day it was created. What it grows joins the central registry and
+        its own roster entry, so it is sharper on the next call."""
         spec = self.team.get(name)
         if not spec:
             return f"{FAILED}no specialist named '{name}'. Roster: {list(self.team.keys())}"
-        child = SelfBuildingAgent(client=self._client(), workspace=os.path.join(self.workspace, "team", name),
-                                    allow_network=self.allow_network, allow_spawn=self.allow_spawn,
-                                    provider=self.provider, model=self.model)
-        child._vault_path = self._vault_path  # one vault, harness-owned
-        child._spawn_depth = self._spawn_depth + 1
-        child.on_event = self.on_event        # its work narrates under yours
-        child.manifest = {t: self.manifest[t] for t in spec["tools"] if t in self.manifest}
-        child.skills = {s: self.skills[s] for s in spec.get("skills", []) if s in self.skills}
-        child.identity = spec["identity"]
-        result = child.run(task)
-        self.cost_usd += child.cost_usd
-        for tool_name, code in child.manifest.items():   # merge growth back to the central registry
-            if tool_name not in self.manifest:
-                self.manifest[tool_name] = code
-                spec["tools"].append(tool_name)
-        for skill_name, skill in child.skills.items():   # skills the specialist wrote or refined
-            if skill_name not in self.skills:
-                spec.setdefault("skills", []).append(skill_name)
-            self.skills[skill_name] = skill
-        if child.identity != spec["identity"]:            # specialists tune their own prompts too
-            spec["identity"] = child.identity
-        return result["output"]
+        child = self._child(spec["identity"],
+                            os.path.join(self.workspace, "team", name),
+                            spec["tools"], spec.get("skills", []))
+        output = self._run_child(child, task)
+        # _absorb already put its growth in the central registry. All that is
+        # left is which of it this specialist now owns, and who it has become.
+        spec["tools"] = list(child.manifest)
+        spec["skills"] = list(child.skills)
+        spec["identity"] = child.identity
+        return output
 
     def dissolve_specialist(self, name: str) -> str:
         """Remove a stale specialist from the roster. Its tools stay in the
@@ -442,29 +591,23 @@ class SelfBuildingAgent:
         return (f"Dissolved '{name}'. Its tools and skills are back in your context; "
                 f"its memory remains on disk.")
 
-    def spawn_agent(self, identity: str, task: str, tools: list = None, seed_memory: str = "") -> str:
-        """One-off sub-agent: injected prompt, optional tool subset (all
-        yours if unspecified), optional seed memory. Runs one task, is wound
-        down. Nothing registered; its growth is reported, not kept."""
+    def spawn_agent(self, identity: str, task: str, tools: list = None,
+                    seed_memory: str = "") -> str:
+        """One-off sub-agent: injected prompt, optional tool subset (all yours
+        if unspecified), optional seed memory. Runs one task and is wound
+        down — but anything it had to build to finish gets kept, the same as
+        if you had built it."""
         if self._spawn_depth >= MAX_SPAWN_DEPTH:
             return f"{FAILED}max recursion depth reached."
-        child = SelfBuildingAgent(client=self._client(),
-                                    workspace=os.path.join(self.workspace, f"adhoc_{uuid.uuid4().hex[:6]}"),
-                                    allow_network=self.allow_network, allow_spawn=self.allow_spawn,
-                                    provider=self.provider, model=self.model)
-        child._vault_path = self._vault_path
-        child._spawn_depth = self._spawn_depth + 1
-        child.on_event = self.on_event
         names = tools if tools else list(self.manifest.keys())
-        child.manifest = {n: self.manifest[n] for n in names if n in self.manifest}
-        child.skills = dict(self.skills)      # a one-off still gets the house knowledge
-        child.identity = identity
+        child = self._child(identity,
+                            os.path.join(self.workspace, f"adhoc_{uuid.uuid4().hex[:6]}"),
+                            names)
         if seed_memory:
             child._raw_write(seed_memory)
-        result = child.run(task)
-        self.cost_usd += child.cost_usd
-        new = [n for n in child.manifest if n not in names]
-        return result["output"] + (f" [sub-agent also grew (not kept): {', '.join(new)}]" if new else "")
+        grown = [n for n in child.manifest if n not in names]
+        output = self._run_child(child, task)
+        return output + (f" [it also built, and you kept: {', '.join(grown)}]" if grown else "")
 
     # ---------------- schemas & system prompt ----------------
 
@@ -489,15 +632,16 @@ class SelfBuildingAgent:
         return {"name": name, "description": doc,
                 "parameters": {"type": "object", "properties": props, "required": required}}
 
-    def _assigned_tools(self) -> set:
+    def _assigned(self, field: str) -> set:
+        """Everything the team owns, and so everything the root stops carrying."""
         out = set()
         for spec in self.team.values():
-            out.update(spec["tools"])
+            out.update(spec.get(field, ()))
         return out
 
     def _tools_schema(self) -> list[dict]:
         schema = [self._schema_for(name, getattr(self, name)) for name in self._meta_names()]
-        assigned = self._assigned_tools() if self._spawn_depth == 0 else set()
+        assigned = self._assigned("tools") if self._spawn_depth == 0 else set()
         for name, entry in self.manifest.items():
             if name in assigned:
                 continue  # a specialist owns it — out of the root's context
@@ -514,15 +658,9 @@ class SelfBuildingAgent:
                 continue
         return schema
 
-    def _assigned_skills(self) -> set:
-        out = set()
-        for spec in self.team.values():
-            out.update(spec.get("skills", []))
-        return out
-
     def _build_system(self) -> str:
         parts = [self.identity]
-        assigned = self._assigned_skills() if self._spawn_depth == 0 else set()
+        assigned = self._assigned("skills") if self._spawn_depth == 0 else set()
         index = [f"- {n}: {s['when']}" for n, s in self.skills.items() if n not in assigned]
         if index:
             # Only the index rides in the prompt. Bodies load through
@@ -769,8 +907,10 @@ _ACTIVITY = {
     "grow_skill":          ("✎", "wrote a note"),
     "read_skill":          ("↳", "read a note"),
     "forget_skill":        ("✗", "dropped a note"),
+    "forget_tool":         ("✗", "dropped a tool"),
     "update_identity":     ("⟲", "rewrote itself"),
     "read_prompt":         ("↳", "read a prompt"),
+    "survey":              ("⌕", "read all of"),
     "update_prompt":       ("⟲", "rewrote a prompt"),
     "create_specialist":   ("⚑", "new specialist"),
     "call_specialist":     ("→", "handed off to"),
@@ -781,34 +921,72 @@ _ACTIVITY = {
 # agent's own activity reads as nested underneath.
 _HANDOFF = ("call_specialist", "spawn_agent")
 
+# Colour says WHAT KIND of thing a name is, so a tool never reads as a note.
+_ANSI = {"tool": "36", "skill": "32", "prompt": "35", "team": "33",
+         "store": "34", "ok": "32", "bad": "31", "dim": "2"}
+_KIND = {"grow_tool": "tool", "read_tool": "tool",
+         "forget_tool": "tool",
+         "grow_skill": "skill", "read_skill": "skill", "forget_skill": "skill",
+         "read_prompt": "prompt", "update_prompt": "prompt", "update_identity": "prompt",
+         "survey": "store",
+         "create_specialist": "team", "call_specialist": "team",
+         "dissolve_specialist": "team", "spawn_agent": "team"}
+
+
+def _painter():
+    """Colour only when a human is watching. Pipes and NO_COLOR opt out, so
+    redirected output stays free of escape codes."""
+    if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        return lambda text, kind: text
+    return lambda text, kind: f"\033[{_ANSI[kind]}m{text}\033[0m"
+
+
+def _cell(text: str, width: int, kind: str, paint) -> str:
+    """Paint the text, pad with the PLAIN width — escape codes are invisible
+    to the eye but not to str.ljust."""
+    return paint(text, kind) + " " * max(0, width - len(text))
+
 
 def _one_line(text, limit: int) -> str:
     text = " ".join(str(text or "").split())
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
+def _described(result: str) -> str:
+    """read_tool and read_skill both answer '<name> — <description>' on line
+    one, then the body. The description is the part worth showing."""
+    head = (result or "").split("\n", 1)[0]
+    return head.split(" — ", 1)[1] if " — " in head else ""
+
+
 def _columns(tool: str, args: dict, result: str) -> tuple[str, str]:
-    """(what it acted on, why) — the two right-hand columns of a line."""
-    name = _one_line(args.get("name") or "", 24)
+    """(what it acted on, what that is) — the two right-hand columns."""
+    name = _one_line(args.get("name") or "", 22)
     if tool == "grow_tool":
         m = _re.match(r"Grew (\w+)", result)          # the harness names it back
-        return (m.group(1) if m else "?"), _one_line(args.get("description"), 40)
+        return (m.group(1) if m else "?"), _one_line(args.get("description"), 44)
     if tool == "grow_skill":
-        return name, _one_line(args.get("when_to_use"), 40)
+        return name, _one_line(args.get("when_to_use"), 44)
+    if tool in ("read_skill", "read_tool"):
+        return name, _one_line(_described(result), 44)
+    if tool == "survey":
+        return _one_line(args.get("source") or "memory", 22), \
+            _one_line(args.get("question"), 44)
     if tool == "create_specialist":
-        return name, _one_line(args.get("description"), 40)
+        return name, _one_line(args.get("description"), 44)
     if tool == "call_specialist":
-        return name, _one_line(args.get("task"), 40)
+        return name, _one_line(args.get("task"), 44)
     if tool == "spawn_agent":
-        return "one-off", _one_line(args.get("task"), 40)
+        return "one-off", _one_line(args.get("task"), 44)
     if tool == "update_identity":
         return f"{len(args.get('new_identity') or '')} chars", ""
     return name, ""
 
 
 def _call_args(args: dict) -> str:
-    """A grown tool's call, the way you'd say it out loud."""
-    vals = [_one_line(v, 16) for v in args.values() if v not in (None, "", [], {})]
+    """A grown tool's call, the way you'd say it out loud. Values get room to
+    stay whole — a filename cut in half tells you nothing."""
+    vals = [_one_line(v, 26) for v in args.values() if v not in (None, "", [], {})]
     return ", ".join(vals)
 
 
@@ -820,15 +998,27 @@ def _reporter():
     work indents under the handoff that started it.
     """
     was_fresh = [False]
+    paint = _painter()
 
     def report(ev: dict) -> None:
-        pad = "  " + "  " * ev["depth"]
-        if ev["fresh"] and not was_fresh[0]:
-            print(f"{pad}·· reviewing its own work ··", flush=True)
-        was_fresh[0] = ev["fresh"]
+        fresh = ev["fresh"]
+        if fresh and not was_fresh[0]:
+            print(paint("  ┌── reviewing its own work " + "─" * 44, "dim"), flush=True)
+        was_fresh[0] = fresh
+        # A rail down the left edge so the review reads as one block, plainly
+        # separate from the task you actually asked for.
+        pad = "  " + (paint("│ ", "dim") if fresh else "") + "  " * ev["depth"]
 
         if ev["phase"] == "answer":
-            print(f"{pad}✓ {'reviewed' if ev['fresh'] else 'answered'}", flush=True)
+            if fresh and ev["depth"] == 0:
+                print(paint("  └── done reviewing", "dim") + "\n", flush=True)
+                return
+            print(f"{pad}{paint('✓ answered', 'ok')}", flush=True)
+            # Say it the moment it exists. The maintenance review runs inside
+            # the same run() call, and printing after it made a one-call task
+            # look like a twenty-call one.
+            if ev["depth"] == 0:
+                print("\n" + (ev["result"] or "(no answer)") + "\n", flush=True)
             return
 
         tool, handoff = ev["tool"], ev["tool"] in _HANDOFF
@@ -837,16 +1027,21 @@ def _reporter():
             return                                    # otherwise each call prints once
 
         if failed:
-            mark, verb, subject = "✗", "failed", _one_line(tool, 24)
-            tail = _one_line(ev["result"][len(FAILED):], 40)
+            mark, verb, subject, kind = "✗", "failed", _one_line(tool, 22), "bad"
+            tail = _one_line(ev["result"][len(FAILED):], 44)
         elif ev["meta"]:
             mark, verb = _ACTIVITY.get(tool, ("·", tool))
             subject, tail = _columns(tool, ev["args"], ev["result"])
-        else:                                         # a tool it grew, doing its job
-            mark, verb = "▸", "ran it"
-            subject = _one_line(f"{tool}({_call_args(ev['args'])})", 24)
-            tail = "→  " + _one_line(ev["result"], 40)
-        print(f"{pad}{mark} {verb:<17}{subject:<24}{tail}".rstrip(), flush=True)
+            kind = _KIND.get(tool, "tool")
+        else:
+            # A tool it grew, doing its job. What it was called WITH is the
+            # readable part; the raw return is usually a wall of JSON.
+            mark, verb, subject, kind = "▸", "ran it", _one_line(tool, 22), "tool"
+            inputs = _one_line(_call_args(ev["args"]), 26)
+            tail = (inputs + " " * max(0, 28 - len(inputs))
+                    + paint("→  " + _one_line(ev["result"], 22), "dim"))
+        print((f"{pad}{paint(f'{mark} {verb:<17}', 'dim')}"
+               f"{_cell(subject, 24, kind, paint)}{tail}").rstrip(), flush=True)
 
     return report
 
@@ -876,7 +1071,10 @@ def _main():
         sys.exit(f"could not load provider '{args.provider}': {e}")
     if os.path.exists(args.state):
         agent.load(args.state)
-        print(f"[loaded: {len(agent.manifest)} tools, team of {len(agent.team)}, "
+        def count(n, thing):
+            return f"{n} {thing}{'' if n == 1 else 's'}"
+        print(f"[loaded: {count(len(agent.manifest), 'tool')}, "
+              f"{count(len(agent.skills), 'skill')}, team of {len(agent.team)}, "
               f"identity {len(agent.identity)} chars]")
     else:
         print("[cold start]")
@@ -903,7 +1101,9 @@ def _main():
             print("stored:", ", ".join(agent.secret_names()) or "(none)")
             continue
         if low.startswith("!fb "):
-            print(agent.feedback(task[4:].strip())["output"])
+            out = agent.feedback(task[4:].strip())["output"]
+            if not agent.on_event:            # the narrator already said it
+                print(out)
             agent.save(args.state)
             continue
         if low in ("new", "clear"):
@@ -927,7 +1127,6 @@ def _main():
                 print(f"  - {n}" + (f"  [owned by {owner}]" if owner else ""))
             continue
         if low == "skills":
-            assigned_s = agent._assigned_skills()
             for n, s in agent.skills.items():
                 owner = next((sn for sn, sp in agent.team.items()
                               if n in sp.get("skills", [])), None)
@@ -952,8 +1151,18 @@ def _main():
             print(agent._raw_read() or "(empty)")
             continue
         try:
+            wall, calls, waiting = time.perf_counter(), agent.model_calls, agent.model_seconds
             answer = agent.run(task)["output"]
-            print(("\n" if agent.on_event else "") + answer)
+            if agent.on_event:
+                # The narrator already said the answer, mid-turn. All that's
+                # left is the footer: model time vs total time is the whole
+                # diagnosis — if they're close, the turn is generation-bound.
+                wall = time.perf_counter() - wall
+                waiting = agent.model_seconds - waiting
+                print(f"  · {agent.model_calls - calls} model calls · {waiting:.1f}s "
+                      f"waiting on the model · {wall:.1f}s total")
+            else:
+                print(answer)
         except Exception as e:
             # A provider error should cost you one turn, not the session.
             print(f"[call failed: {type(e).__name__}: {str(e)[:300]}]")
