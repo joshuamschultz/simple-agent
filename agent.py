@@ -79,7 +79,8 @@ except ImportError:
                 and os.path.exists(_venv) \
                 and os.path.realpath(sys.prefix) != os.path.realpath(os.path.join(_HERE, ".venv")):
             os.execv(_venv, [_venv, os.path.abspath(__file__), *sys.argv[1:]])
-        sys.exit("Not set up yet. Run ./setup.sh once, then `python3 agent.py`.")
+        sys.exit(f"Not set up yet. Run {os.path.join(_HERE, 'setup.sh')} once, "
+                 f"then `python3 agent.py`.")
 
 # Every prompt this file fills in. There is no copy of them in the source: the
 # words are written into agent_state.json once, by setup.sh, and belong to the
@@ -174,8 +175,12 @@ class SelfBuildingAgent:
         self.cost_usd = 0.0
         self.model_calls = 0          # how many round trips, and how long they took —
         self.model_seconds = 0.0      # the only honest way to locate a slow turn
-        self.workspace = workspace
-        os.makedirs(workspace, exist_ok=True)
+        # Absolute from here on. Grown code runs in a subprocess with cwd set to
+        # this directory, and children are handed the same string — a relative
+        # one would re-resolve against whatever cwd each of those happened to
+        # have, and the store would quietly split in two.
+        self.workspace = os.path.abspath(workspace)
+        os.makedirs(self.workspace, exist_ok=True)
         # Empty on purpose. The words come from agent_state.json, which setup.sh
         # writes before this ever runs; a child gets them handed down from its
         # parent. Nothing here invents a default, so there is only ever one copy.
@@ -201,7 +206,7 @@ class SelfBuildingAgent:
         self._asked = [0]
         self._fresh_turn = False
         self._spawn_depth = 0
-        self._vault_path = os.path.join(workspace, ".secrets.json")
+        self._vault_path = os.path.join(self.workspace, ".secrets.json")
         if not os.path.exists(self._vault_path):
             with open(self._vault_path, "w") as f:
                 f.write("{}")
@@ -1473,8 +1478,13 @@ def _main():
     p = argparse.ArgumentParser()
     p.add_argument("--allow-network", action="store_true")
     p.add_argument("--allow-spawn", action="store_true")
-    p.add_argument("--workspace", default="agent_workspace")
-    p.add_argument("--state", default="agent_state.json")
+    # Anchored to the directory this file lives in, not to wherever you happen
+    # to be standing. The agent IS its state file, so the two travel together:
+    # move the folder, run it from anywhere, call it through a symlink or an
+    # alias — it still finds itself. A path passed explicitly is yours and is
+    # resolved against your shell's cwd, the way every other CLI behaves.
+    p.add_argument("--workspace", default=os.path.join(_HERE, "agent_workspace"))
+    p.add_argument("--state", default=os.path.join(_HERE, "agent_state.json"))
     p.add_argument("--provider", default="anthropic", help="anything llm.py supports")
     p.add_argument("--model", default=None, help="defaults to the provider's default_model")
     p.add_argument("--quiet", action="store_true", help="hide the live activity lines")
@@ -1499,12 +1509,14 @@ def _main():
     # there is no agent to run. setup.sh writes it, which is why this can simply
     # say so rather than invent a stand-in.
     if not os.path.exists(args.state):
-        sys.exit(f"no {args.state} — run ./setup.sh once, then `python3 agent.py`.")
+        sys.exit(f"no {args.state} — run {os.path.join(_HERE, 'setup.sh')} once, "
+                 f"then `python3 agent.py`.")
     agent.load(args.state)
     missing = [k for k in REQUIRED_PROMPTS if not agent.prompts.get(k)]
     if missing:
         sys.exit(f"{args.state} is missing the {missing} prompt(s). Restore them in that "
-                 f"file, or move it aside and re-run ./setup.sh for a fresh agent.")
+                 f"file, or move it aside and re-run {os.path.join(_HERE, 'setup.sh')} "
+                 f"for a fresh agent.")
     def count(n, thing):
         return f"{n} {thing}{'' if n == 1 else 's'}"
     print(f"[loaded: {count(len(agent.manifest), 'tool')}, "

@@ -87,6 +87,24 @@ python3 agent.py
 > _
 ```
 
+Run it from anywhere. `agent.py` finds its own state file, its workspace and its
+`.env` next to itself, not next to your shell, so `python3 ~/code/simple-agent/agent.py`
+works from any directory and an alias or a symlink to it works too.
+
+### Moving it, or taking it to another machine
+
+The folder is the agent. Move it, rename it, put it on a stick — it still finds
+itself. Two things do not travel:
+
+- **`.venv`** — a virtualenv has absolute paths baked into it. Delete it and run
+  `./setup.sh` again in the new location. Setup is safe to re-run.
+- **`.env`** — your API key. Not in the repo, on purpose. Copy it across yourself,
+  or let `setup.sh` write a fresh one from `.env.example`.
+
+`agent_state.json` is the part worth carrying: it *is* the agent — its tools, its
+skills, its team, its words. Copy that file and everything it has learned comes
+with it.
+
 Zero of everything, because it hasn't built anything yet. Every run it tells you
 what it has become:
 

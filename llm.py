@@ -70,7 +70,8 @@ def venv_handoff(entry_file: str) -> None:
     if entry and os.path.exists(venv_py) and \
             os.path.realpath(sys.prefix) != os.path.realpath(venv_dir):
         os.execv(venv_py, [venv_py, os.path.abspath(entry_file), *sys.argv[1:]])
-    sys.exit("Not set up yet. Run ./setup.sh once, then `python3 agent.py`.")
+    sys.exit(f"Not set up yet. Run {os.path.join(here, 'setup.sh')} once, "
+             f"then `python3 agent.py`.")
 
 
 def load_env(project_dir: str) -> None:
