@@ -50,6 +50,7 @@ identical runner before real stakes.
 """
 
 from __future__ import annotations
+import ast
 import inspect
 import json
 import os
@@ -60,7 +61,6 @@ import subprocess
 import sys
 import textwrap
 import time
-import types
 import uuid
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -119,12 +119,17 @@ SURVEY_CHUNK = 400000      # characters handed to one reader ~= 100k tokens. Sma
 # it is why traces can record success without parsing anything.
 FAILED = "FAILED: "
 
-_JSON_TYPE = {str: "string", int: "integer", float: "number", bool: "boolean",
-              list: "array", dict: "object"}
+_JSON_TYPE: dict[object, str] = {
+    str: "string", int: "integer", float: "number", bool: "boolean",
+    list: "array", dict: "object",
+}
 # `from __future__ import annotations` hands every annotation over as its NAME,
 # so a lever declared `tools: list` would be advertised as a string — and then
 # handed one. Both spellings mean the same JSON type.
-_JSON_TYPE.update({t.__name__: kind for t, kind in list(_JSON_TYPE.items())})
+_JSON_TYPE.update({
+    "str": "string", "int": "integer", "float": "number", "bool": "boolean",
+    "list": "array", "dict": "object",
+})
 
 _RUNNER = '''
 import json, os, sys
@@ -185,7 +190,7 @@ class SelfBuildingAgent:
         # writes before this ever runs; a child gets them handed down from its
         # parent. Nothing here invents a default, so there is only ever one copy.
         self.prompts: dict[str, str] = {}
-        self.manifest: dict[str, str] = {}          # ALL grown tools, central
+        self.manifest: dict[str, str | dict[str, str]] = {}  # all grown tools
         self.skills: dict[str, dict] = {}           # name -> {when, body, uses}
         self.team: dict[str, dict] = {}             # name -> {identity, tools, skills, description}
         self.traces: list[dict] = []
@@ -236,6 +241,13 @@ class SelfBuildingAgent:
                 text = text.replace(value, f"[REDACTED:{name}]")
         return text
 
+    def _inside_workspace(self, path: str) -> str:
+        """Resolve a model-supplied path and keep it on the agent's desk."""
+        resolved = os.path.realpath(os.path.join(self.workspace, path))
+        if os.path.commonpath((self.workspace, resolved)) != self.workspace:
+            raise ValueError("path must stay inside the workspace")
+        return resolved
+
     # ---------------- raw storage ----------------
 
     def _raw_read(self) -> str:
@@ -273,10 +285,14 @@ class SelfBuildingAgent:
 
     def _validate(self, code: str, fn_name: str) -> bool:
         try:
-            compile(code, "<grown>", "exec")
-        except SyntaxError:
+            tree = ast.parse(code, "<grown>", "exec")
+        except (SyntaxError, ValueError):
             return False
-        return f"def {fn_name}(" in code
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+        if len(functions) != 1 or functions[0].name != fn_name:
+            return False
+        args = functions[0].args
+        return bool(args.args and args.args[0].arg == "self")
 
     def _run_sandboxed(self, fn_name: str, kwargs: dict) -> str:
         """One grown tool, called by name, with its arguments."""
@@ -532,7 +548,7 @@ class SelfBuildingAgent:
         reads the same sources for one call and no reading at all."""
         try:
             text = self._source_text(source)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             return f"{FAILED}cannot read '{source}': {e}"
         if not text.strip():
             return f"'{source}' is empty."
@@ -586,7 +602,7 @@ class SelfBuildingAgent:
         if source == "state":
             return json.dumps({"manifest": self.manifest, "skills": self.skills,
                                "prompts": self.prompts, "team": self.team}, indent=2)
-        with open(source) as f:
+        with open(self._inside_workspace(source)) as f:
             return f.read()
 
     def read_skill(self, name: str) -> str:
@@ -675,11 +691,13 @@ class SelfBuildingAgent:
         return f"Rewrote the '{name}' prompt ({len(text)} chars). It takes effect immediately."
 
     def create_specialist(self, name: str, identity: str, tools: list, description: str,
-                          skills: list = None) -> str:
+                          skills: list | None = None) -> str:
         """Promote a tool-and-skill family into a standing specialist: its own
         system prompt, the named tool subset and skill subset (both moved out
         of your context), a one-line description for your roster, and its own
         persistent memory that accumulates across every call to it."""
+        if not _re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", name):
+            return f"{FAILED}specialist name must be a short lowercase slug."
         skills = list(skills or [])
         missing = [t for t in tools if t not in self.manifest]
         if missing:
@@ -723,7 +741,7 @@ class SelfBuildingAgent:
         return (f"Dissolved '{name}'. Its tools and skills are back in your context; "
                 f"its memory remains on disk.")
 
-    def spawn_agent(self, identity: str, task: str, tools: list = None,
+    def spawn_agent(self, identity: str, task: str, tools: list | None = None,
                     seed_memory: str = "") -> str:
         """One-off sub-agent: injected prompt, optional tool subset (all yours
         if unspecified), optional seed memory. Runs one task and is wound
@@ -1038,8 +1056,10 @@ class SelfBuildingAgent:
     def _record(self, task: str, calls: list[dict], output: str, success: bool) -> dict:
         """Append one trace. The full history is an append-only log on disk;
         only the recent tail rides along in the state file."""
-        trace = {"task": task, "output": output[:600], "used": [c["tool"] for c in calls],
-                 "outcome": success, "correction": None, "calls": calls}
+        safe_calls = json.loads(self._redact(json.dumps(calls)))
+        trace = {"task": self._redact(task), "output": self._redact(output[:600]),
+                 "used": [c["tool"] for c in calls], "outcome": success,
+                 "correction": None, "calls": safe_calls}
         self.traces.append(trace)
         try:
             with open(os.path.join(self.workspace, "traces.jsonl"), "a") as f:
@@ -1050,9 +1070,10 @@ class SelfBuildingAgent:
 
     def _session_review(self, limit: int = REVIEW_WINDOW) -> str:
         """Render the recent session verbatim: each task, the tool calls it
-        made with their results, and the answer given. Counts say whether the
-        machinery ran; only the transcript shows whether the user was served."""
-        recent = [t for t in self.traces[-limit:] if t["task"] != "[maintenance]"]
+        made with their results, and the answer given. The inventory says what
+        machinery you had; only the transcript shows whether the user was
+        served by it — every correction, rephrase and repeat is in here."""
+        recent = self._window(limit)
         if not recent:
             return "(no session yet)"
         out = []
@@ -1066,24 +1087,87 @@ class SelfBuildingAgent:
             out.append(f"YOU: {(t.get('output') or '')[:250]}")
             if t.get("correction"):
                 out.append(f"  ** THE USER THEN CORRECTED YOU: {t['correction']}")
-        usage: dict[str, int] = {}
-        for t in recent:
+        return "\n".join(out)
+
+    def _window(self, limit: int = REVIEW_WINDOW) -> list[dict]:
+        """The traces a review covers: real exchanges, newest last. Its own
+        maintenance turns are excluded — reviewing them would grade the
+        grader, and every count here is meant to be about the work."""
+        real = [t for t in self.traces if t["task"] != "[maintenance]"]
+        return real[-limit:]
+
+    def _reach(self, limit: int = REVIEW_WINDOW) -> tuple[dict[str, int], dict[str, int]]:
+        """What you actually reached for across the window: how many times
+        each tool was called, and how many times each skill was read. A count
+        of zero is the interesting number in both — it means a capability you
+        paid to build sat there while you worked around it."""
+        tools: dict[str, int] = {}
+        skills: dict[str, int] = {}
+        for t in self._window(limit):
             for c in t.get("calls", []):
-                usage[c["tool"]] = usage.get(c["tool"], 0) + 1
-        unused = [n for n in self.manifest if n not in usage]
-        if unused:
-            out.append(f"\nTools you never reached for: {', '.join(unused)}")
-        if self.skills:
-            out.append("Skills and how often you read them: " + ", ".join(
-                f"{n} {s.get('uses', 0)}x" for n, s in self.skills.items()))
+                tools[c["tool"]] = tools.get(c["tool"], 0) + 1
+                if c["tool"] == "read_skill":
+                    name = (c.get("args") or {}).get("name")
+                    if name:
+                        skills[name] = skills.get(name, 0) + 1
+        return tools, skills
+
+    def _self_inventory(self, limit: int = REVIEW_WINDOW) -> str:
+        """Everything you are made of, laid out beside the transcript: every
+        tool with what it claims and how often it earned a call, every skill
+        with when it loads and how often it was read, and the full text of the
+        prompts that wrote both.
+
+        The transcript shows what happened. This shows what you had to work
+        with while it happened, which is the only way to see the second kind
+        of finding — not a call that went wrong, but a capability that was
+        never reached for, or one that should exist and does not. Descriptions
+        are given in full here; on a normal turn you only ever see the first
+        line, so this is your one chance to notice that the rest of it lies.
+        """
+        tool_calls, skill_reads = self._reach(limit)
+        out = [f"=== YOUR TOOLS ({len(self.manifest)}) — what each claims, and how often "
+               f"you called it in this window ==="]
+        for n, entry in self.manifest.items():
+            tally = f"{tool_calls[n]}x" if tool_calls.get(n) else "NEVER CALLED"
+            out.append(f"- {n} [{tally}] — {self._describe(entry) or '(no description)'}")
+        if not self.manifest:
+            out.append("(none — you have grown nothing yet)")
+        builtin = sorted(((n, c) for n, c in tool_calls.items() if n not in self.manifest),
+                          key=lambda p: -p[1])
+        if builtin:
+            # How you spent your turns outside your own tools. Heavy run_python
+            # or raw-store use is a tool you never got around to growing.
+            out.append("Built-in calls this window: " + ", ".join(f"{n} {c}x" for n, c in builtin))
+
+        out.append(f"\n=== YOUR SKILLS ({len(self.skills)}) — when each loads, how often you "
+                   f"read it in this window, and how often ever ===")
+        for n, s in self.skills.items():
+            tally = f"{skill_reads[n]}x" if skill_reads.get(n) else "NEVER READ HERE"
+            out.append(f"- {n} [{tally}, {s.get('uses', 0)}x lifetime] — {s.get('when', '')}")
+        if not self.skills:
+            out.append("(none — every judgment you have made, you made from scratch)")
+
+        out.append("\n=== YOUR PROMPTS, in full — the words that produced everything above. "
+                   "A tool that came out badly is a 'draft' problem. A miss this review keeps "
+                   "making is a 'review' problem. Fix the words, not the instance ===")
+        for n, text in self.prompts.items():
+            out.append(f"--- prompt '{n}' ({len(text)} chars) ---\n{text}")
         return "\n".join(out)
 
     def _act_review(self):
-        """The periodic review: hand the model its own transcript and ask one
-        question of it. Runs isolated, so it never joins the conversation."""
+        """The periodic review: hand the model its own transcript AND its own
+        inventory, then ask one question of it. Runs isolated, so it never
+        joins the conversation."""
+        prompt = self.prompts["review"]
+        transcript, inventory = self._session_review(), self._self_inventory()
+        if "{inventory}" not in prompt:
+            # A review prompt written before the inventory existed still gets
+            # it, appended to the transcript rather than silently dropped.
+            transcript = f"{transcript}\n\n{inventory}"
         return self.act(
-            self.prompts["review"].format(
-                REVIEW_WINDOW=REVIEW_WINDOW, transcript=self._session_review()),
+            prompt.format(REVIEW_WINDOW=REVIEW_WINDOW,
+                          transcript=transcript, inventory=inventory),
             fresh=True)
 
     def review(self) -> dict:
@@ -1129,17 +1213,21 @@ class SelfBuildingAgent:
 
     # ---------------- persistence ----------------
 
-    def save(self, path: str):
+    def save(self, path: str) -> None:
         # Only the recent tail of history lives here. The rest is already in
         # workspace/traces.jsonl, so state.json stays a roughly fixed size no
         # matter how many months this agent has been running.
-        with open(path, "w") as f:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
             json.dump({"manifest": self.manifest, "skills": self.skills,
                         "prompts": self.prompts,      # identity lives in here too
                         "team": self.team,
                         "since_review": self.tasks_since_maintenance,
                         "corrections_since_review": self.corrections_since_review,
                         "traces": self.traces[-TRACES_IN_STATE:]}, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
     def load(self, path: str):
         with open(path) as f:
@@ -1341,7 +1429,9 @@ def _read_key() -> str:
     Raw mode is entered and left around a single read, so a question never
     leaves the terminal in a strange state if the turn dies mid-choice.
     """
-    import select, termios, tty
+    import select
+    import termios
+    import tty
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     try:
@@ -1416,7 +1506,7 @@ def _asker():
               + paint(_one_line(header, 44), "dim"), flush=True)
 
     def choose(q, options, multi, width) -> str:
-        cursor, picked, height = 0, set(), 0
+        cursor, picked, height = 0, set[int](), 0
         while True:
             lines = draw(q, options, cursor, picked, multi, width)
             sys.stdout.write(("\033[%dA" % height if height else "")
@@ -1474,7 +1564,8 @@ def _asker():
 # ---------------- REPL ----------------
 
 def _main():
-    import argparse, getpass
+    import argparse
+    import getpass
     p = argparse.ArgumentParser()
     p.add_argument("--allow-network", action="store_true")
     p.add_argument("--allow-spawn", action="store_true")

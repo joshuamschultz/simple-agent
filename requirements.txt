@@ -2,6 +2,6 @@
 #
 # arcllm is the provider-agnostic LLM client: direct HTTP to 16 providers,
 # zero vendor SDKs. Swapping providers is a command-line flag.
-arcllm>=0.2
+arcllm==0.7.0
 # Loads .env so a project key beats whatever the shell exports.
-python-dotenv>=1.0
+python-dotenv==1.2.2

@@ -1,0 +1,29 @@
+[project]
+name = "simple-agent"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "arcllm==0.7.0",
+  "python-dotenv==1.2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy==1.17.1",
+  "pytest==8.4.1",
+  "pytest-cov==6.2.1",
+  "ruff==0.12.8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+warn_unused_ignores = true
+ignore_missing_imports = true

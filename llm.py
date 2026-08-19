@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+from typing import Any
 
 # Imported at module scope ON PURPOSE. agent.py decides whether it can run by
 # trying to import this module; a lazily-imported backend would let that probe
@@ -104,8 +105,8 @@ class LLM:
 
     def __init__(self, provider: str = "anthropic", model: str | None = None,
                  label: str | None = None):
-        opts = {"telemetry": True,   # per-call USD cost
-                "retry": True}       # backoff on 429/5xx
+        opts: dict[str, Any] = {"telemetry": True,   # per-call USD cost
+                                "retry": True}       # backoff on 429/5xx
         # agent_label tags traces per agent; older arcllm releases don't take
         # it, and it isn't worth pinning a version over.
         if label and "agent_label" in inspect.signature(load_model).parameters:
@@ -123,7 +124,7 @@ class LLM:
     def _to_blocks(content):
         if isinstance(content, str):
             return content
-        out = []
+        out: list[Any] = []
         for b in content:
             if b["type"] == "text":
                 out.append(TextBlock(text=b["text"]))
